@@ -1,0 +1,10 @@
+[workspace]
+members = ["account"]
+
+[package]
+name = "GrayMarket"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+account = { path = "account" }

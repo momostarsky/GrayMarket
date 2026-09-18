@@ -1,0 +1,9 @@
+[package]
+name = "account"
+version = "0.1.0"
+edition = "2024"
+description = "Account domain library, reusable across projects"
+license = "MIT"
+
+[dependencies]
+rust_decimal = "1.43.0"
