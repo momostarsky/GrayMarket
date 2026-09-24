@@ -1,0 +1,18 @@
+{
+  "09018": {
+    "symbol": "09018",
+    "name": "示例证券",
+    "currency": "CNY",
+    "lot_size": { "units": 100 },
+    "price_tick": { "units": 1 },
+    "market": "HKEX"
+  },
+  "600000": {
+    "symbol": "600000",
+    "name": "浦发银行",
+    "currency": "CNY",
+    "lot_size": { "units": 100 },
+    "price_tick": { "units": 100 },
+    "market": "SSE"
+  }
+}

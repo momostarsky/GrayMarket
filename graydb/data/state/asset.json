@@ -1,0 +1,41 @@
+{
+  "A001": {
+    "account_id": "A001",
+    "currency": "CNY",
+    "available": {
+      "units": 99279800
+    },
+    "frozen": {
+      "units": 0
+    },
+    "total_market_value": {
+      "units": 720200
+    }
+  },
+  "A002": {
+    "account_id": "A002",
+    "currency": "CNY",
+    "available": {
+      "units": 48799400
+    },
+    "frozen": {
+      "units": 1200600
+    },
+    "total_market_value": {
+      "units": 1200600
+    }
+  },
+  "A003": {
+    "account_id": "A003",
+    "currency": "CNY",
+    "available": {
+      "units": 0
+    },
+    "frozen": {
+      "units": 0
+    },
+    "total_market_value": {
+      "units": 0
+    }
+  }
+}

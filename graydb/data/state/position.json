@@ -1,0 +1,28 @@
+{
+  "A001:09018": {
+    "account_id": "A001",
+    "symbol": "09018",
+    "quantity": {
+      "units": 800
+    },
+    "available_qty": {
+      "units": 800
+    },
+    "avg_cost": {
+      "units": 90025
+    }
+  },
+  "A002:600000": {
+    "account_id": "A002",
+    "symbol": "600000",
+    "quantity": {
+      "units": 2000
+    },
+    "available_qty": {
+      "units": 0
+    },
+    "avg_cost": {
+      "units": 60030
+    }
+  }
+}

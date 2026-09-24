@@ -15,8 +15,7 @@ fn main() {
         println!("Buy Price: {}", price.to_decimal().unwrap());
     }
 
-    let sell_price = Price::from_str("10.00153");
-    if let Some(price) = sell_price {
+    let sell_price = Price::parse_rounded("10.00153", Rounding::MidpointAwayFromZero);  if let Some(price) = sell_price {
         println!("Sell Price: {}", price.to_decimal().unwrap());
     }
     let buy_amount: Money = notional(buy_price.unwrap(), nums.unwrap(), Rounding::MidpointAwayFromZero).unwrap();

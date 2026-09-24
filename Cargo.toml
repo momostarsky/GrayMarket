@@ -8,4 +8,5 @@ edition = "2024"
 
 [dependencies]
 account = { path = "account" }
-rust_decimal =  { version = "1.43.0", features = ["macros", "serde-float"] }
+rust_decimal =  { version = "1.43.0", features = ["macros", "serde-with-str"] }
+serde = { version = "1", features = ["derive"] }

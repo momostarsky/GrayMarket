@@ -6,4 +6,8 @@ description = "Account domain library, reusable across projects"
 license = "MIT"
 
 [dependencies]
-rust_decimal = "1.43.0"
+rust_decimal =  { version = "1.43.0", features = ["macros", "serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

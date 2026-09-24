@@ -104,6 +104,8 @@ use core::iter::Sum;
 use core::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::ser::SerializeStruct;
 
 mod sealed {
     pub trait Sealed {}
@@ -226,7 +228,10 @@ pub type WideMoney = Amount<{ scale::MONEY }, i128>;
 pub type WideMicroAmount = Amount<{ scale::MICRO }, i128>;
 
 /// 缩小标度（÷10^n）时的舍入策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// 序列化为 snake_case 字符串（如 `"midpoint_away_from_zero"`），便于配置文件与
+/// 协议报文直接书写；未知策略名反序列化会报错，不会退化成默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Rounding {
     /// 四舍五入，遇 0.5 远离零 —— A 股 / 中国结算的常规口径，也是 [`Default`]。
     #[default]
@@ -244,7 +249,11 @@ pub enum Rounding {
 /// 把中间结果（`i128`）落成 `i64` 余额时的失败原因。
 ///
 /// 三种情况都必须由业务显式处理，绝不能退化为截断或饱和。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// 把中间结果（`i128`）落成 `i64` 余额时的失败原因。
+///
+/// 序列化为 snake_case 字符串，便于日志、错误响应与落库记录原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SettleError {
     /// `decimal_places` 大于该类型的标度 —— 调用错误（不可能舍入出更强的精度）。
     PrecisionTooHigh,
@@ -257,6 +266,26 @@ pub enum SettleError {
     /// 超出 `i64` 余额可表示范围（`i128` 中间结果落不回 `i64`）。
     OutOfRange,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParseAmountError {
+    /// 不是合法的十进制字面量。
+    InvalidSyntax,
+    /// 无法在目标类型下**精确**表示：小数位多于 `SCALE` 且存在非零余数，或超出后备整数范围。
+    NotRepresentable,
+}
+
+impl fmt::Display for ParseAmountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseAmountError::InvalidSyntax => write!(f, "invalid decimal syntax"),
+            ParseAmountError::NotRepresentable => {
+                write!(f, "value not representable in target scale/backing")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseAmountError {}
 
 /// 定点数：`SCALE` 位小数，内部是 [`Backing`] 整数计数。
 ///
@@ -265,6 +294,37 @@ pub enum SettleError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct Amount<const SCALE: u32, B: Backing = i64>(B);
+
+/// 序列化为 `{ "units": <整数> }`：保留原始最小单位计数，不经过浮点，杜绝精度损失。
+impl<const SCALE: u32, B: Backing + Serialize> Serialize for Amount<SCALE, B> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("Amount", 1)?;
+        state.serialize_field("units", &self.0)?;
+        state.end()
+    }
+}
+impl<const SCALE: u32, B: Backing> core::str::FromStr for Amount<SCALE, B> {
+    type Err = ParseAmountError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let decimal = value
+            .parse::<Decimal>()
+            .map_err(|_| ParseAmountError::InvalidSyntax)?;
+        Self::from_decimal_exact(decimal).ok_or(ParseAmountError::NotRepresentable)
+    }
+}
+
+/// 从 `{ "units": <整数> }` 反序列化，标度 `SCALE` 由目标类型决定（数据里不存 scale）。
+impl<'de, const SCALE: u32, B: Backing + Deserialize<'de>> Deserialize<'de> for Amount<SCALE, B> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Repr<B> {
+            units: B,
+        }
+        Ok(Amount::from_units(Repr::<B>::deserialize(deserializer)?.units))
+    }
+}
 
 impl<const SCALE: u32, B: Backing> Amount<SCALE, B> {
     /// 零。
@@ -425,21 +485,25 @@ impl<const SCALE: u32, B: Backing> Amount<SCALE, B> {
         };
         B::from_i128(units).map(Amount)
     }
-
-    /// 从十进制字符串构造（如 `"9.0025"`），超出标度时四舍五入。
-    ///
-    /// 解析失败（非法数字）或超出可表示范围均返回 `None`。
-    /// 需要指定舍入策略请用 [`Amount::from_str_with`]。
-    #[inline]
     #[must_use]
-    pub fn from_str(value: &str) -> Option<Self> {
-        Self::from_str_with(value, Rounding::MidpointAwayFromZero)
+    pub fn from_decimal_exact(value: Decimal) -> Option<Self> {
+        let from = value.scale();
+        if from > SCALE {
+            let divisor = pow10_i128(from - SCALE)?;
+            if value.mantissa() % divisor != 0 {
+                return None;
+            }
+        }
+        Self::from_decimal_with(value, Rounding::TowardZero)
     }
 
-    /// 同 [`Amount::from_str`]，但可指定舍入策略。
+
     #[must_use]
-    pub fn from_str_with(value: &str, rounding: Rounding) -> Option<Self> {
-        value.parse::<Decimal>().ok().and_then(|d| Self::from_decimal_with(d, rounding))
+    pub fn parse_rounded(value: &str, rounding: Rounding) -> Option<Self> {
+        value
+            .parse::<Decimal>()
+            .ok()
+            .and_then(|d| Self::from_decimal_with(d, rounding))
     }
 
     /// 转成 `Decimal`（单位：整数单位，如元），用于落库、对账、日志等冷路径。
@@ -1043,6 +1107,69 @@ mod tests {
         assert_eq!(core::mem::size_of::<Money>(), core::mem::size_of::<Price>());
     }
 
+    // ... existing code ...
+    #[test]
+    fn parse_via_from_str_is_exact_or_rejected() {
+        assert_eq!("1023.35".parse::<Money>().unwrap().units(), 102_335);
+        assert_eq!("9.0025".parse::<Price>().unwrap().units(), 90_025);
+        assert_eq!("-0.01".parse::<Money>().unwrap().units(), -1);
+        assert_eq!("0".parse::<Money>().unwrap(), Money::ZERO);
+        assert_eq!("100".parse::<Money>().unwrap(), Money::from_whole(100).unwrap());
+        // 尾零不算精度损失
+        assert_eq!("1.230".parse::<Money>().unwrap().units(), 123);
+        // 数量：SCALE = 0，任何小数位都算损失
+        assert_eq!("777".parse::<Quantity>().unwrap().units(), 777);
+        assert_eq!(
+            "777.5".parse::<Quantity>().unwrap_err(),
+            ParseAmountError::NotRepresentable
+        );
+
+        // 需要舍入 → 拒绝，不静默改变金额
+        assert_eq!(
+            "1.234".parse::<Money>().unwrap_err(),
+            ParseAmountError::NotRepresentable
+        );
+        assert_eq!(
+            "10.00153".parse::<Price>().unwrap_err(),
+            ParseAmountError::NotRepresentable
+        );
+        // 超出后备整数范围
+        assert_eq!(
+            (i64::MAX as i128 + 1).to_string().parse::<Money>().unwrap_err(),
+            ParseAmountError::NotRepresentable
+        );
+        // 语法非法
+        assert_eq!("abc".parse::<Money>().unwrap_err(), ParseAmountError::InvalidSyntax);
+        assert_eq!("".parse::<Money>().unwrap_err(), ParseAmountError::InvalidSyntax);
+        assert_eq!("1.2.3".parse::<Money>().unwrap_err(), ParseAmountError::InvalidSyntax);
+    }
+
+    #[test]
+    fn parse_rounded_is_the_explicit_lossy_path() {
+        // 同一份输入：严格解析失败，显式给策略才允许舍入。
+        assert!("1.234".parse::<Money>().is_err());
+        assert_eq!(
+            Money::parse_rounded("1.234", Rounding::MidpointAwayFromZero).unwrap().units(),
+            123
+        );
+        assert_eq!(Money::parse_rounded("1.235", Rounding::MidpointAwayFromZero).unwrap().units(), 124);
+        assert_eq!(Money::parse_rounded("1.239", Rounding::TowardZero).unwrap().units(), 123);
+        assert_eq!(Price::parse_rounded("10.00153", Rounding::TowardZero).unwrap().units(), 100_015);
+        assert!(Money::parse_rounded("abc", Rounding::Ceil).is_none());
+    }
+
+    #[test]
+    fn from_decimal_exact_distinguishes_trailing_zeros_from_real_loss() {
+        use rust_decimal::Decimal;
+        // 3 位小数但余数为 0 → 精确，可接受
+        assert_eq!(Money::from_decimal_exact(Decimal::new(1230, 3)).unwrap().units(), 123);
+        // 3 位小数且真有余数 → 拒绝
+        assert_eq!(Money::from_decimal_exact(Decimal::new(1234, 3)), None);
+        assert_eq!(Money::from_decimal_exact(Decimal::new(-1234, 3)), None);
+        // 标度不足时是精确放大
+        assert_eq!(MicroAmount::from_decimal_exact(Decimal::new(1, 4)).unwrap().units(), 100);
+    }
+
     #[test]
     fn format_fixed_pads_and_rounds_for_display() {
         // dp < SCALE：纯显示层舍入，不改动自身
@@ -1062,5 +1189,249 @@ mod tests {
         // dp = 0：舍入到整数
         assert_eq!(Money::from_units(1_050).format_fixed(0), "11");
     }
-    
+
+    // ==================== 序列化 ====================
+
+    #[test]
+    fn serializes_as_units_object() {
+        assert_eq!(serde_json::to_string(&Money::from_units(12_345)).unwrap(), r#"{"units":12345}"#);
+        assert_eq!(serde_json::to_string(&Quantity::from_units(777)).unwrap(), r#"{"units":777}"#);
+        assert_eq!(serde_json::to_string(&Price::from_units(-100)).unwrap(), r#"{"units":-100}"#);
+        assert_eq!(serde_json::to_string(&Money::ZERO).unwrap(), r#"{"units":0}"#);
+    }
+
+    #[test]
+    fn round_trip_preserves_value_across_scales() {
+        // 含 i64::MIN / -1 / 0 的边界，各标度容器都要无损往返。
+        let samples: [i64; 6] = [0, 1, -1, 99, 12_345, i64::MIN];
+        for units in samples {
+            let json = format!(r#"{{"units":{units}}}"#);
+            assert_eq!(serde_json::from_str::<Money>(&json).unwrap().units(), units);
+            assert_eq!(serde_json::from_str::<Price>(&json).unwrap().units(), units);
+            assert_eq!(serde_json::from_str::<Quantity>(&json).unwrap().units(), units);
+            assert_eq!(serde_json::from_str::<MicroAmount>(&json).unwrap().units(), units);
+            assert_eq!(serde_json::to_string(&serde_json::from_str::<Money>(&json).unwrap()).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn wide_backing_round_trips() {
+        // i128 后备：可容纳超出 i64 的中间结果。
+        let wide = WideMoney::from_units(i64::MAX as i128 + 1);
+        let json = serde_json::to_string(&wide).unwrap();
+        assert_eq!(json, format!(r#"{{"units":{}}}"#, i64::MAX as i128 + 1));
+        assert_eq!(serde_json::from_str::<WideMoney>(&json).unwrap(), wide);
+        assert_eq!(serde_json::from_str::<WideMicroAmount>(&json).unwrap().units(), wide.units());
+    }
+
+    #[test]
+    fn nested_amount_field_round_trips_like_domain_json() {
+        // 模拟 graydb mock JSON（账户/资产文件）中嵌套 Amount 字段的整体形态。
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Asset {
+            account_id: String,
+            available: Money,
+            frozen: Money,
+        }
+
+        let original = Asset {
+            account_id: "A001".to_string(),
+            available: Money::from_decimal(Decimal::new(1_000_050, 2)).unwrap(),
+            frozen: Money::ZERO,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(json, r#"{"account_id":"A001","available":{"units":1000050},"frozen":{"units":0}}"#);
+        assert_eq!(serde_json::from_str::<Asset>(&json).unwrap(), original);
+    }
+
+    #[test]
+    fn scale_is_not_stored_in_the_payload() {
+        // 设计决策：数据里只有 units，标度由目标 Rust 类型决定。
+        let json = r#"{"units":10000}"#;
+        assert_eq!(serde_json::from_str::<Money>(json).unwrap().to_string(), "100.00");
+        assert_eq!(serde_json::from_str::<Price>(json).unwrap().to_string(), "1.00");
+        assert_eq!(serde_json::from_str::<Quantity>(json).unwrap().to_string(), "10000");
+        // 同一份字节流按不同口径解释出的数值不同 —— 反证「字段类型必须与表定义对齐」。
+        assert_ne!(
+            serde_json::from_str::<Money>(json).unwrap().units(),
+            serde_json::from_str::<Price>(json).unwrap().units() / 100
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_payloads() {
+        // 缺 units 字段
+        assert!(serde_json::from_str::<Money>(r#"{}"#).is_err());
+        // 未知字段（deny_unknown_fields）
+        assert!(serde_json::from_str::<Money>(r#"{"units":1,"value":2}"#).is_err());
+        // 字段名拼错
+        assert!(serde_json::from_str::<Money>(r#"{"unit":1}"#).is_err());
+        // units 为字符串
+        assert!(serde_json::from_str::<Money>(r#"{"units":"12345"}"#).is_err());
+        // units 为浮点数：拒绝任何经浮点的资金数据
+        assert!(serde_json::from_str::<Money>(r#"{"units":100.05}"#).is_err());
+        // 重复字段
+        assert!(serde_json::from_str::<Money>(r#"{"units":1,"units":2}"#).is_err());
+        // 裸标量不是合法形态
+        assert!(serde_json::from_str::<Money>("12345").is_err());
+        assert!(serde_json::from_str::<Money>("null").is_err());
+    }
+
+   // ... existing code ...
+    #[test]
+    fn out_of_range_units_fails_loudly_not_truncated() {
+        // 超出 i64 后备范围：WideMoney 可解析，Money 必须报错而不是截断/饱和。
+        let json = format!(r#"{{"units":{}}}"#, i64::MAX as i128 + 1);
+        assert!(serde_json::from_str::<WideMoney>(&json).is_ok());
+        assert!(serde_json::from_str::<Money>(&json).is_err());
+
+        let json_min = format!(r#"{{"units":{}}}"#, i128::from(i64::MIN) - 1);
+        assert!(serde_json::from_str::<Money>(&json_min).is_err());
+    }
+
+    // ==================== Rounding / SettleError 序列化 ====================
+
+    #[test]
+    fn rounding_serializes_as_snake_case() {
+        let cases: [(Rounding, &str); 5] = [
+            (Rounding::MidpointAwayFromZero, "midpoint_away_from_zero"),
+            (Rounding::TowardZero, "toward_zero"),
+            (Rounding::AwayFromZero, "away_from_zero"),
+            (Rounding::Floor, "floor"),
+            (Rounding::Ceil, "ceil"),
+        ];
+        for (rounding, name) in cases {
+            let json = format!(r#""{name}""#);
+            assert_eq!(serde_json::to_string(&rounding).unwrap(), json);
+            assert_eq!(serde_json::from_str::<Rounding>(&json).unwrap(), rounding);
+        }
+    }
+
+    #[test]
+    fn rounding_default_survives_round_trip() {
+        // 默认策略是 A 股口径，序列化后必须仍是它（防止 rename_all 改动悄悄换语义）。
+        let default = Rounding::default();
+        let restored: Rounding = serde_json::from_str(&serde_json::to_string(&default).unwrap()).unwrap();
+        assert_eq!(restored, Rounding::MidpointAwayFromZero);
+    }
+
+    #[test]
+    fn rounding_rejects_unknown_and_misformatted_names() {
+        // 未知策略名：不能退化成默认值（静默换舍入方向 = 静默改变金额）。
+        assert!(serde_json::from_str::<Rounding>(r#""half_up""#).is_err());
+        assert!(serde_json::from_str::<Rounding>(r#""round_half_up""#).is_err());
+        // 大小写敏感：只接受 snake_case。
+        assert!(serde_json::from_str::<Rounding>(r#""Floor""#).is_err());
+        assert!(serde_json::from_str::<Rounding>(r#""FLOOR""#).is_err());
+        // 驼峰 / 原始 PascalCase 名不接受。
+        assert!(serde_json::from_str::<Rounding>(r#""midpointAwayFromZero""#).is_err());
+        assert!(serde_json::from_str::<Rounding>(r#""MidpointAwayFromZero""#).is_err());
+        // 不接受整数判别式与 null。
+        assert!(serde_json::from_str::<Rounding>("0").is_err());
+        assert!(serde_json::from_str::<Rounding>("null").is_err());
+
+        // serde 外部标签表示法：单位变体也可写成 `{"变体": <payload>}`，payload 被忽略。
+        // 这是 derive 的既定行为，不是缺陷 —— 记录下来，避免以后误判为漏洞。
+        assert_eq!(serde_json::from_str::<Rounding>(r#"{"floor":null}"#).unwrap(), Rounding::Floor);
+        // 但未知变体在这一形态下同样被拒绝（键解析先于值），不会静默通过。
+        assert!(serde_json::from_str::<Rounding>(r#"{"half_up":null}"#).is_err());
+    }
+
+    #[test]
+    fn settle_error_serializes_as_snake_case() {
+        let cases: [(SettleError, &str); 3] = [
+            (SettleError::PrecisionTooHigh, "precision_too_high"),
+            (SettleError::BelowMinimumUnit, "below_minimum_unit"),
+            (SettleError::OutOfRange, "out_of_range"),
+        ];
+        for (error, name) in cases {
+            let json = format!(r#""{name}""#);
+            assert_eq!(serde_json::to_string(&error).unwrap(), json);
+            assert_eq!(serde_json::from_str::<SettleError>(&json).unwrap(), error);
+        }
+        assert!(serde_json::from_str::<SettleError>(r#""overflow""#).is_err());
+    }
+
+ // ... existing code ...
+    #[test]
+    fn settle_error_from_real_settle_failure_round_trips() {
+        // 端到端：真调用 settle() 拿到错误，序列化后可跨进程原样还原。
+        // 三种标度/后备组合各自独立断言 —— SCALE 是类型参数，不同标度无法放进同一集合。
+        let below_unit = WideMicroAmount::from_units(3_000)
+            .settle(2, Rounding::MidpointAwayFromZero)
+            .unwrap_err();
+        assert_eq!(below_unit, SettleError::BelowMinimumUnit);
+        assert_eq!(
+            serde_json::from_str::<SettleError>(&serde_json::to_string(&below_unit).unwrap()).unwrap(),
+            SettleError::BelowMinimumUnit
+        );
+
+        let out_of_range = WideMoney::from_units(i64::MAX as i128 + 1)
+            .settle(2, Rounding::MidpointAwayFromZero)
+            .unwrap_err();
+        assert_eq!(out_of_range, SettleError::OutOfRange);
+        assert_eq!(
+            serde_json::from_str::<SettleError>(&serde_json::to_string(&out_of_range).unwrap()).unwrap(),
+            SettleError::OutOfRange
+        );
+
+        let too_precise = WideMoney::from_units(1)
+            .settle(3, Rounding::MidpointAwayFromZero)
+            .unwrap_err();
+        assert_eq!(too_precise, SettleError::PrecisionTooHigh);
+        assert_eq!(
+            serde_json::from_str::<SettleError>(&serde_json::to_string(&too_precise).unwrap()).unwrap(),
+            SettleError::PrecisionTooHigh
+        );
+
+        // SettleError 本身与标度无关，可以进集合统一校验命名。
+        let all_variants = [
+            SettleError::PrecisionTooHigh,
+            SettleError::BelowMinimumUnit,
+            SettleError::OutOfRange,
+        ];
+        let json = serde_json::to_string(&all_variants).unwrap();
+        assert_eq!(json, r#"["precision_too_high","below_minimum_unit","out_of_range"]"#);
+        assert_eq!(serde_json::from_str::<Vec<SettleError>>(&json).unwrap(), all_variants.to_vec());
+    }
+// ... existing code ...
+    #[test]
+    fn rounding_and_amount_deserialize_from_config_json() {
+        // mock 配置文件的典型形态：舍入策略 + 金额阈值混在一个对象里。
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct FeePolicy {
+            rate_bp: u32,
+            rounding: Rounding,
+            min_fee: Money,
+            fallback: Option<Rounding>,
+        }
+
+        let json = r#"{"rate_bp":30,"rounding":"toward_zero","min_fee":{"units":5},"fallback":null}"#;
+        let policy: FeePolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(policy.rounding, Rounding::TowardZero);
+        assert_eq!(policy.min_fee, Money::from_units(5));
+        assert_eq!(policy.fallback, None);
+        assert_eq!(serde_json::to_string(&policy).unwrap(), json);
+
+        // 缺字段 / 多字段都要报错：配置不接受隐式默认。
+        assert!(serde_json::from_str::<FeePolicy>(r#"{"rate_bp":30,"min_fee":{"units":5}}"#).is_err());
+        assert!(serde_json::from_str::<FeePolicy>(&format!("{json},\"extra\":1}}")).is_err());
+    }
+
+    #[test]
+    fn collections_of_enums_round_trip() {
+        // 订阅协议里的 ops 列表形态（见 graydb 订阅设计）。
+        let strategies = [Rounding::Floor, Rounding::Ceil, Rounding::TowardZero];
+        let json = serde_json::to_string(&strategies).unwrap();
+        assert_eq!(json, r#"["floor","ceil","toward_zero"]"#);
+        let restored: Vec<Rounding> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, strategies.to_vec());
+
+        let errors = vec![SettleError::OutOfRange, SettleError::PrecisionTooHigh];
+        let json = serde_json::to_string(&errors).unwrap();
+        assert_eq!(json, r#"["out_of_range","precision_too_high"]"#);
+        assert_eq!(serde_json::from_str::<Vec<SettleError>>(&json).unwrap(), errors);
+    }
+// ... existing code ...
+// ... existing code ...
 }
