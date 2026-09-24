@@ -91,8 +91,71 @@ position 主键 == position_key(...)
 | 5 | `store/mod.rs::load_all` 用 `std::any::type_name::<T>()` 当文件名（路径含泛型名，实际不可用），且与 `mem::Snapshot::load` 语义重叠 | **待定**：A 表名参数化改造 / B 删除（建议 B，阶段 4 接 PG 时重新设计） |
 | 6 | `journal.rs` 有 `Order`/`Trade` 类型但无样本文件、无调用方 | 阶段 1 产出 `data/journal/*.jsonl` 并接入 |
 | 7 | `Order.created_at: String`，时间类型策略未定（`jiff` / `time` / `chrono`） | 阶段 1 决策；保持 ISO8601 字符串 + 单一转换点 |
-| 8 | 资金原语返回 `bool`，丢失了拒单原因 | 阶段 1.2 升级为 `Result<(), RejectReason>` |
+| 8 | 资金原语返回 `bool`，丢失了拒单原因 | 阶段 1.2 升级为 `Result<(), RejectReason>` | 
+| 10 | **`Snapshot` 硬编码 5 张表**：struct 字段 / load 路径 / check_integrity / save 四处手工同步，表数量增长不可扩展；`#[derive(Default)]` 使「漏注册」不报错 | 阶段 0.5 引入 `tables.rs` 表清单 |
 
+## 四、阶段计划
+
+### ✅ 阶段 0：Mock 数据与内存加载（已完成）
+
+领域结构 + JSON 数据 + 加载即校验 + 不变量测试。
+
+**验收**：`cargo test -p graydb` 6 passed；`cargo clippy -p graydb --all-targets` 无警告（依赖遗留 1–4 清理）。
+
+### 阶段 0.5：表清单与注册中心（**必须先于阶段 1**）
+
+目标：把「一张表 = 四处硬编码」收敛为「一处声明 + 一个 impl」，为多表、订阅、PG 接入解锁。
+
+| 任务 | 说明 |
+|---|---|
+| 0.5.1 `tables.rs` | `Spec { id, file, kind, policy, pk, fk }` + `TABLES: &[Spec]` 清单；`Kind::{Dict,State}`、`LoadPolicy::{Critical,Optional,Lazy}` |
+| 0.5.2 `DataTable` trait | `const ID` 绑定类型与声明；`pk_parts()` 统一主键拼法（取代 `position_key`）；`check_row()` 承载逐行不变量 |
+| 0.5.3 通用加载器 | `load_table::<T>()`：读文件 + 「JSON 键 == 主键」机械校验 + `check_row`；漏写 `impl DataTable` 因泛型约束编译失败 |
+| 0.5.4 声明式外键校验 | 遍历 `Spec::fk` 的通用检查器，删除 `check_integrity` 里手写的 `for` 循环 |
+| 0.5.5 `TableStat` | `{ id, rows, policy, lsn }`：LSN 锚点、内存预算、日终对账的公共底座（现在只填 rows） |
+| 0.5.6 分级启动 | `Critical` 失败拒绝启动；`Optional` 失败告警降级；`Lazy` 不进启动清单 |
+| 0.5.7 删除 `store/` | `Store<T,K>` + `type_name::<T>()` 方案与 0.5.1 冲突（表名必须显式），见遗留问题 5 |
+| 0.5.8 守护测试 | `every_declared_table_is_loaded_and_nonempty_or_marked`、`table_ids_are_unique_and_match_files` |
+
+**验收标准**：
+- 新增一张表只需改 `tables.rs`（1 行）+ `domain` 里 1 个 `impl DataTable` + `Snapshot` 1 个字段；
+- 守护测试能捕获「声明了没加载」「加载成空表」「主键拼写不符」三类错误；
+- 现有 6 个测试语义不变（迁移后仍通过）。
+
+**刻意不做**（避免过度设计）：
+- 不引入运行时动态注册 / 插件式表发现 —— 表清单是代码，必须可 grep、可静态核对；
+- 不把热路径的 `HashMap<String, Asset>` 改成 `dyn Any` 容器 —— 内核访问必须零开销且类型安全；
+- 不做百万行大表的列式/arena 存储 —— 等阶段 4 有真实体量数据再决策（`Kind`/`LoadPolicy` 已预留）。
+
+### 阶段 1：内核写路径（**下一步**）
+<!-- ... existing code ... -->
+| 1.1 `engine.rs` | 单线程内核：持 `Snapshot` + `seq: u64` + `Journal`，暴露 `place` / `cancel` / `apply_fill`；访问表走 `Snapshot` 强类型字段（零开销） |
+<!-- ... existing code ... -->
+### 阶段 2：日志与恢复
+
+- 2.1 JSONL 升级为 `(term, seq)` 段文件布局（mmap 追加写）；记录携带 `table: &'static str`（取自 `Spec::id`），回放按表分流；
+<!-- ... existing code ... -->
+### 阶段 3：订阅分发
+
+- 3.1 在写路径唯一出口挂 `tokio::sync::broadcast<RowChange>`；
+- 3.2 协议：`Subscribe { tables, ops, snapshot, columns, filter }`；帧含 `SNAPSHOT_BEGIN / ROW / SNAPSHOT_END` 屏障；
+- 3.3 断线按 `seq` 从 ring buffer 补发，补不齐降级为重新下发快照；
+- 3.4 慢消费者隔离：broadcast 丢包 → 客户端触发快照重建，不拖累内核主循环；
+- 3.5 主题粒度：`table:{spec.id}`、`table:{schema}.*`、`table:*`；`tables` 入参用 `spec_of()` 校验，未知表名直接拒绝订阅；
+- 3.6 全量快照下发遍历 `TABLES`，无需为新表改订阅代码。
+<!-- ... existing code ... -->
+### 阶段 4：接入真实 PG
+
+- 4.1 `tokio-postgres` + `COPY`；`store` 模块此时正式成型（对齐 `Snapshot` 的加载接口）；
+- 4.2 日初加载记录 `(lsn, batch_seq)` 锚点，日终校验主数据在窗口内未被改写；锚点落在 `TableStat.lsn`（按表粒度）；
+- 4.3 逻辑复制槽（wal2json 验证 → pgoutput 定稿）单向同步主数据变更进内存；PG 表名 = `Spec::id`，订阅槽与清单自动对齐；
+- 4.4 日终归档：重放日志 → `COPY` 进 PG，顺带产出 Parquet 冷备；导出 SQL 由 `TABLES` 生成；
+- 4.5 替换数据源：`load_table::<T>()` 的文件读取换成 `COPY TO STDOUT` / 流式查询，**表清单与校验逻辑完全复用**，`data/` 退化为测试 fixture。
+<!-- ... existing code ... -->
+| `SCALE` 不存在数据里，喂错容器 | 同一份 JSON 被按不同口径解读 | 测试已文档化；加载时校验数量级 |
+| 表数量增长导致加载/校验/保存三处不同步 | 静默少加载一张表，业务在缺数据的情况下继续跑 | 阶段 0.5 表清单单一事实源 + 守护测试 |
+| 表名在 topic / WAL / COPY 三处各写一遍字符串 | 拼写不一致，订阅收不到、归档进错表 | 阶段 0.5：`Spec::id` 作为唯一身份贯穿三处 |
+| 所有表同等重要（一张附表坏 = 全停） | 可用性被最弱依赖绑架 | 阶段 0.5.6 分级启动 |
 ## 四、阶段计划
 
 ### ✅ 阶段 0：Mock 数据与内存加载（已完成）
