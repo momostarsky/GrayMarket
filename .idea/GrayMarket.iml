@@ -5,6 +5,8 @@
       <sourceFolder url="file://$MODULE_DIR$/account/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/account/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/graydb/graydb/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/graydb/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

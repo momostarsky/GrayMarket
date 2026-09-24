@@ -213,6 +213,7 @@ pub mod scale {
 
 /// 数量：整股 / 整张（`SCALE = 0`）。
 pub type Quantity = Amount<{ scale::QUANTITY }>;
+
 /// 金额：0.01 元（`SCALE = 2`）—— 资金、成交额、费用的唯一记账口径。
 pub type Money = Amount<{ scale::MONEY }>;
 /// 价格：0.0001 元（`SCALE = 4`）—— 委托价、成交价、单位净值。
@@ -251,6 +252,7 @@ pub enum SettleError {
     ///
     /// 典型场景是手续费 0.003 元舍入到「分」：这笔钱既不能凭空消失，也不该静默记成 0，
     /// 通常按业务规则进位到 0.01 或拒绝该笔指令。
+    ///
     BelowMinimumUnit,
     /// 超出 `i64` 余额可表示范围（`i128` 中间结果落不回 `i64`）。
     OutOfRange,
@@ -424,6 +426,22 @@ impl<const SCALE: u32, B: Backing> Amount<SCALE, B> {
         B::from_i128(units).map(Amount)
     }
 
+    /// 从十进制字符串构造（如 `"9.0025"`），超出标度时四舍五入。
+    ///
+    /// 解析失败（非法数字）或超出可表示范围均返回 `None`。
+    /// 需要指定舍入策略请用 [`Amount::from_str_with`]。
+    #[inline]
+    #[must_use]
+    pub fn from_str(value: &str) -> Option<Self> {
+        Self::from_str_with(value, Rounding::MidpointAwayFromZero)
+    }
+
+    /// 同 [`Amount::from_str`]，但可指定舍入策略。
+    #[must_use]
+    pub fn from_str_with(value: &str, rounding: Rounding) -> Option<Self> {
+        value.parse::<Decimal>().ok().and_then(|d| Self::from_decimal_with(d, rounding))
+    }
+
     /// 转成 `Decimal`（单位：整数单位，如元），用于落库、对账、日志等冷路径。
     ///
     /// `Decimal` 的系数只有 96 位，超出其可表示范围时返回 `None`。
@@ -432,6 +450,58 @@ impl<const SCALE: u32, B: Backing> Amount<SCALE, B> {
     pub fn to_decimal(self) -> Option<Decimal> {
         Decimal::try_from_i128_with_scale(self.0.to_i128(), SCALE).ok()
     }
+
+    /// 按固定 `dp` 位小数格式化（四舍五入），小数位不足时补零，不省略尾零。
+    ///
+    /// 纯格式化操作，不修改自身：`dp < SCALE` 时舍入显示，`dp > SCALE` 时补零。
+    /// 与 [`Display`] 的区别：`Display` 会去掉多余尾零（至少保留 2 位），
+    /// 本方法严格输出 `dp` 位小数（`dp == 0` 时无小数点）。
+    /// `10^dp` 超出可表示范围时退化为科学计数法（与 [`Display`] 的兜底一致）。
+    #[must_use]
+    pub fn format_fixed(&self, dp: u32) -> String {
+        let value = self.0.to_i128();
+        let sign = if value < 0 { "-" } else { "" };
+        if dp == 0 {
+            let rounded =
+                rescale_down(value, pow10_i128(SCALE).unwrap_or(1), Rounding::MidpointAwayFromZero);
+            return match rounded {
+                Some(q) => format!("{sign}{}", q.unsigned_abs()),
+                None => format!("{sign}{}e-{SCALE}", value.unsigned_abs()),
+            };
+        }
+        match 10i128.checked_pow(dp) {
+            None => format!("{sign}{}e-{dp}", value.unsigned_abs()),
+            Some(pow_i) => {
+                let scaled = if dp >= SCALE {
+                    match value.checked_mul(pow10_i128(dp - SCALE).unwrap_or(1)) {
+                        Some(v) => v,
+                        None => return format!("{sign}{}e-{dp}", value.unsigned_abs()),
+                    }
+                } else {
+                    match rescale_down(
+                        value,
+                        pow10_i128(SCALE - dp).unwrap_or(1),
+                        Rounding::MidpointAwayFromZero,
+                    ) {
+                        Some(q) => q,
+                        None => return format!("{sign}{}e-{dp}", value.unsigned_abs()),
+                    }
+                };
+                let magnitude = scaled.unsigned_abs();
+                let pow = pow_i.unsigned_abs();
+                let (whole, frac) = (magnitude / pow, magnitude % pow);
+                // Deleted:let min_len = if dp >= 2 { 2 } else { 1 };
+                let digits = format!("{:0dp$}", frac, dp = dp as usize);
+                // Deleted:let frac_str = if digits.len() > min_len && digits.ends_with('0') {
+                // Deleted:    format!("{:.min_len$}", digits.trim_end_matches('0'))
+                // Deleted:} else {
+                // Deleted:    digits
+                // Deleted:};
+                format!("{sign}{whole}.{digits}")
+            }
+        }
+    }
+
 
     /// 溢出返回 `None` 的加法（同标度才有意义）。
     #[inline]
@@ -972,4 +1042,25 @@ mod tests {
         assert_eq!(WideMicroAmount::scale(), 6);
         assert_eq!(core::mem::size_of::<Money>(), core::mem::size_of::<Price>());
     }
+
+    #[test]
+    fn format_fixed_pads_and_rounds_for_display() {
+        // dp < SCALE：纯显示层舍入，不改动自身
+        assert_eq!(Money::from_units(-1235).format_fixed(1), "-12.4");
+        // dp == SCALE：严格保留 dp 位（与 Display 的「至少 2 位去尾零」不同）
+        assert_eq!(Money::from_units(12_300).format_fixed(2), "123.00");
+        // dp > SCALE：补零到指定位数
+        assert_eq!(Money::from_units(12_345).format_fixed(4), "123.4500");
+        // SCALE=4 的 1 个单位 = 0.0001 元，以 6 位小数展示 → 0.000100
+        assert_eq!(Amount::<4>::from_units(1).format_fixed(6), "0.000100");
+        // 真正百万分之一的容器：SCALE=6 的 1 个单位 = 0.000001
+        assert_eq!(Amount::<6>::from_units(1).format_fixed(6), "0.000001");
+        // 严格固定位数：尾零不再省略
+        assert_eq!(Price::from_units(120_000).format_fixed(4), "12.0000");
+        // 进位溢出 9.999 → 10.00
+        assert_eq!(Amount::<4>::from_units(99_990).format_fixed(2), "10.00");
+        // dp = 0：舍入到整数
+        assert_eq!(Money::from_units(1_050).format_fixed(0), "11");
+    }
+    
 }

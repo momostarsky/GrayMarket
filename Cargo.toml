@@ -1,5 +1,5 @@
 [workspace]
-members = ["account"]
+members = ["account", "graydb"]
 
 [package]
 name = "GrayMarket"
@@ -8,3 +8,4 @@ edition = "2024"
 
 [dependencies]
 account = { path = "account" }
+rust_decimal =  { version = "1.43.0", features = ["macros", "serde-float"] }
