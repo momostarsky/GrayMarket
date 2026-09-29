@@ -1,1 +1,8 @@
 /target
+.idea/
+.classpath
+.project
+.settings/
+.DS_Store
+.gitignore
+.git/
