@@ -1,5 +1,6 @@
 pub mod journal;
 pub mod domain;
+pub mod engine;
 pub mod generated;
 pub mod mem;
 pub mod tables;
@@ -8,7 +9,9 @@ use std::path::Path;
 
 use account::amount::{Money, Price, Quantity, Rounding, notional};
 
-use crate::domain::Security;
+use crate::domain::{Security, Side};
+use crate::engine::{Engine, PlaceRequest};
+use crate::journal::Journal;
 use crate::mem::Snapshot;
 use crate::tables::{ColumnName, DataTable, composite_key_str};
 
@@ -26,9 +29,10 @@ fn main() {
     let snapshot = Snapshot::load(&data_root).expect("主数据加载/校验失败，终止启动");
     snapshot.print_startup_report();
 
-    // 下面两个函数是「如何用 tables 加载 / 遍历」的可运行样板。
+    // 下面三个函数是「如何用 tables 加载 / 遍历 / 写路径」的可运行样板。
     demo_load(&data_root);
     demo_iterate(&snapshot);
+    demo_engine(&data_root);
 }
 
 /// 加载：三种粒度按需选。
@@ -37,7 +41,7 @@ fn demo_load(root: &Path) {
 
     // ① 整份镜像（生产路径）：`Snapshot::load(root)` —— 声明自检 + 逐表加载
     //    + 外键校验 + 聚合不变量，内部对每张表就是下面 ② 那一句（见 `mem.rs::load`）。
-    println!("  ① Snapshot::load → 5 张表全部就位（见上方启动报告）");
+    println!("  ① Snapshot::load → 7 张表全部就位（见上方启动报告）");
 
     // ② 单张表：只关心一类数据时用 `load_table::<T>()`。路径不用手写 ——
     //    由 `T::ID` 反查 `Spec::file`，校验逻辑与 ① 完全一致（不是另一套轻量版本）。
@@ -123,6 +127,62 @@ fn demo_iterate(snapshot: &Snapshot) {
     dump_pk_columns(&snapshot.securities);
 }
 
+/// 内核写路径演示（阶段 1）：下单 → 冻结 → 先写 journal → 改内存 → 成交落账。
+///
+/// 与上面两个只读样板不同，这里会真改内存镜像：为了不把演示结果写回 `data/`，
+/// 现取一份干净镜像喂给内核，journal 落在临时目录 —— 进程退出即丢，
+/// 但序号与落盘顺序已按阶段 1.3/1.5 的规则走完，恢复回放能对得上账。
+fn demo_engine(root: &Path) {
+    println!("\n[7] 内核写路径：place → 冻结 → apply_fill → 落账");
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("graydb-demo-{}.journal.jsonl", std::process::id()));
+    let journal = Journal::open(&path).expect("演示 journal 打开失败");
+    let mut engine = Engine::new(Snapshot::load(root).expect("重新加载一份干净镜像"), journal);
+
+    let asset_before = engine.snapshot.asset("A001").expect("A001 应有资产行");
+    let (available_before, total_before) = (asset_before.available, asset_before.total_market_value);
+
+    // 买 100 股 600000，限价 6.0600，立即全成 —— A001 原本不持此券，走的是首次建仓 `upsert`。
+    let ack = engine
+        .place_and_fill(PlaceRequest {
+            order_id: "O-DEMO-1",
+            account_id: "A001",
+            symbol: "600000",
+            side: Side::Buy,
+            price: Price::from_units(60_600),
+            quantity: Quantity::from_units(100),
+            created_at: "2026-09-29T09:30:00Z",
+        })
+        .expect("演示下单成交不应被拒");
+
+    let asset = engine.snapshot.asset("A001").expect("A001 应有资产行");
+    let position = engine.snapshot.position("A001", "600000").expect("成交后必有持仓行");
+    println!("  受理 {ack:?}，内核序号已分配 {} / 已落盘 {}", engine.seq(), engine.durable());
+    println!("  可用资金 {} → {}（买入冻结与成交扣款均逐笔可追）",
+        available_before.format_fixed(2), asset.available.format_fixed(2));
+    println!("  新持仓 qty={} 可卖={}（T+1：当日买入不可卖） avg_cost={}",
+        position.quantity, position.available_qty, position.avg_cost);
+    println!("  市值 {} → {}（每次成交后按持仓全量重算，非增量累加）",
+        total_before.format_fixed(2), asset.total_market_value.format_fixed(2));
+    println!("  orders={} trades={}", engine.snapshot.orders.len(), engine.snapshot.trades.len());
+
+    // 拒单零状态变化：资金不足直接被拒，镜像与序号一分未动。
+    let seq_before = engine.seq();
+    let rejected = engine.place(PlaceRequest {
+        order_id: "O-DEMO-2",
+        account_id: "A001",
+        symbol: "600000",
+        side: Side::Buy,
+        price: Price::from_units(999_999_999),
+        quantity: Quantity::from_units(100_000),
+        created_at: "2026-09-29T09:31:00Z",
+    });
+    println!("  高价大额下单 → {rejected:?}，序号仍为 {seq_before}（拒单发生在写盘之前）");
+    assert_eq!(engine.seq(), seq_before, "拒单不得消耗序号");
+    engine.snapshot.check_valuation().expect("演示结束后市值仍应平");
+}
+
 /// 泛型遍历：编译期落到具体 `Table<T>`，运行时零擦除（没进 `dyn`，也没造行包装）。
 /// 新表登记进 `TABLES` 并 `impl DataTable` 后，这个函数一行不用改 —— 这就是声明驱动的意义。
 fn dump_pk_columns<T: DataTable>(table: &tables::Table<T>) {
@@ -155,7 +215,7 @@ mod mock_data_tests {
         Snapshot::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).unwrap()
     }
 
-    /// 五份 JSON → 领域结构 → 声明式校验全跑一遍。
+    /// 七份 JSON → 领域结构 → 声明式校验全跑一遍。
     ///
     /// 这里原先手写的两段外键 `for` 循环已删：语义等价地搬进了 `TABLES` 的 `fk` 声明
     /// （`account_info.user_id → user_info`、`position.symbol → dict_security` 等），
@@ -170,6 +230,9 @@ mod mock_data_tests {
         assert_eq!(snap.securities.len(), 2);
         assert_eq!(snap.assets.len(), 3);
         assert_eq!(snap.positions.len(), 2);
+        // 阶段 1 的流水表日初为空，只能由内核写入（与 `tables.toml` 的 `expected_rows = 0` 同源）
+        assert_eq!(snap.orders.len(), 0);
+        assert_eq!(snap.trades.len(), 0);
 
         snap.check_integrity().unwrap();
 

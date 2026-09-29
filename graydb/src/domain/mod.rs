@@ -8,14 +8,13 @@
 //! - 单行不变量写在 `impl RowValidator` 里 —— `check_row` 默认转调它，与生成的
 //!   `impl DataTable` 各占一块，重跑 codegen 不覆盖业务逻辑。
 
-use account::amount::{Money, Price, Quantity};
 use crate::tables::RowValidator;
 use serde::{Deserialize, Serialize};
 
 // codegen 生成的表类型与列枚举：从 `crate::generated` 转出，对外路径仍是 `crate::domain::*`。
 pub use crate::generated::{
-    Account, AccountColumn, Asset, AssetColumn, Position, PositionColumn, Security, SecurityColumn,
-    User, UserColumn,
+    Account, AccountColumn, Asset, AssetColumn, Order, OrderColumn, Position, PositionColumn,
+    Security, SecurityColumn, Trade, TradeColumn, User, UserColumn,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,42 +63,36 @@ pub enum OrderStatus {
 }
 
 // ---------------------------------------------------------------------------
-// 尚未登记进注册中心的类型：`Order` / `Trade`（阶段 1.1 建 engine 时补 DDL + codegen）
-// ---------------------------------------------------------------------------
-
-/// 委托单 —— 未来表: orders
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Order {
-    pub order_id: String, // 主键, 客户端幂等键
-    pub account_id: String,
-    pub symbol: String,
-    pub side: Side,
-    pub price: Price,
-    pub quantity: Quantity,
-    pub filled_qty: Quantity,
-    pub status: OrderStatus,
-    pub created_at: String, // ISO8601, 模拟阶段先字符串
-    pub seq: u64,           // 内核全局序号, 将来 WAL 的 seq
-}
-
-/// 成交 —— 未来表: trades (JSONL 追加写)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Trade {
-    pub trade_id: String,
-    pub order_id: String,
-    pub account_id: String,
-    pub symbol: String,
-    pub side: Side,
-    pub price: Price,
-    pub quantity: Quantity,
-    pub amount: Money, // = notional(price, qty)
-    pub seq: u64,
-}
-
-// ---------------------------------------------------------------------------
 // 单行不变量（人写，跨列/业务约束）：`DataTable::check_row` 默认转调 `validate_row`。
 // 跨表不变量由 `Spec::fk` 声明 + `FkIndex` 承担；聚合不变量（市值守恒）留在 `mem.rs`。
 // ---------------------------------------------------------------------------
+
+/// 订单：数量/价格为正，部分成交不得超过委托量（成交不变量的单行部分）。
+impl RowValidator for Order {
+    fn validate_row(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.order_id.is_empty(), "order_id 不能为空（幂等键）");
+        anyhow::ensure!(self.quantity.is_positive(), "订单 {} 委托数量必须为正", self.order_id);
+        anyhow::ensure!(self.price.is_positive(), "订单 {} 价格必须为正", self.order_id);
+        anyhow::ensure!(
+            self.filled_qty <= self.quantity,
+            "订单 {} 已成交量 {} 超过委托量 {}",
+            self.order_id,
+            self.filled_qty,
+            self.quantity
+        );
+        Ok(())
+    }
+}
+
+/// 成交：数量与金额均为正（金额由 `notional` 算出，不合法即说明上游算错）。
+impl RowValidator for Trade {
+    fn validate_row(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.quantity.is_positive(), "成交 {} 数量必须为正", self.trade_id);
+        anyhow::ensure!(self.price.is_positive(), "成交 {} 价格必须为正", self.trade_id);
+        anyhow::ensure!(!self.amount.is_negative(), "成交 {} 金额为负", self.trade_id);
+        Ok(())
+    }
+}
 
 impl RowValidator for User {
     fn validate_row(&self) -> anyhow::Result<()> {

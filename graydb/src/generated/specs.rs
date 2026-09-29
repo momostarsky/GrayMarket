@@ -50,4 +50,22 @@ pub const TABLES: &[Spec] = &[
         fk: &[("account_id", "account_info", "account_id"), ("symbol", "dict_security", "symbol")],
         expected_rows: Some(2),
     },
+    Spec {
+        id: "orders",
+        file: "state/order.json",
+        kind: Kind::State,
+        policy: LoadPolicy::Critical,
+        pk: &["order_id"],
+        fk: &[("account_id", "account_info", "account_id"), ("symbol", "dict_security", "symbol")],
+        expected_rows: Some(0),
+    },
+    Spec {
+        id: "trades",
+        file: "state/trade.json",
+        kind: Kind::State,
+        policy: LoadPolicy::Critical,
+        pk: &["trade_id"],
+        fk: &[("order_id", "orders", "order_id"), ("account_id", "account_info", "account_id"), ("symbol", "dict_security", "symbol")],
+        expected_rows: Some(0),
+    },
 ];

@@ -180,6 +180,17 @@ impl ColumnIndex {
         self.values.insert(value);
     }
 
+    /// 抹掉某行在本列的全部取值对，并重建成员集 —— `upsert`/`delete` 的防线①（阶段 1.9）：
+    /// 同行二次写入改已索引列后，旧值不得再被 `has` 命中（外键假阳性）。
+    /// 冷路径写入用 `retain` + 重建，规模与行数同阶，百万行表将来换 `HashMap<key, Vec<value>>` 侧索引。
+    fn remove_row(&mut self, row_key: &str) {
+        let before = self.rows.len();
+        self.rows.retain(|(key, _)| key != row_key);
+        if self.rows.len() != before {
+            self.values = self.rows.iter().map(|(_, value)| value.clone()).collect();
+        }
+    }
+
     /// 第一个「本表出现、目标表不存在」的取值及其行主键。
     fn first_missing_in(&self, target: &Self) -> Option<&(String, String)> {
         self.rows.iter().find(|(_, value)| !target.contains(value))
@@ -262,7 +273,34 @@ impl<T: DataTable> Table<T> {
     }
 
     /// 内核写入唯一入口（阶段 1）：主键由 `Spec::pk` × `column` 现算，行与列索引一起更新。
+    ///
+    /// 契约（阶段 1.9 / 1.10，均为机制拦截非注释约定）：
+    /// - 入口强制 `check_row`：非法行在任何变更（行图 / 索引）之前即 `Err`，表不被触碰；
+    /// - 先按行键抹旧索引对再插新值（对 replace 的键不变重写同样成立）：改已索引列不残留假阳性；
+    /// - 行键已被占用即拒绝（静默双行 / 覆盖都不允许）—— 本入口语义 = **纯插入**，
+    ///   重写已有行（含改非索引列、改已索引列、改主键）一律走 [`Table::replace`]；
+    /// - 改主键（行级迁移）走 [`Table::replace`]；非索引列原地改走 `rows_mut()`；
+    /// - 增删行、改已索引列一律走本入口族，不绕过。
     pub fn upsert(&mut self, row: T) -> anyhow::Result<()> {
+        self.write_row(row, None)
+    }
+
+    /// 以 `old_key` 为身份重写整行：行图与全部列索引从 `old_key` 迁移到新主键拼出的行键。
+    /// 调用方（内核）知道「改的是哪一行」，旧键显式传入、不靠取值猜测；
+    /// `old_key` 不存在于行图时拒绝 —— 防拿错键静默新建重复行。
+    pub fn replace(&mut self, old_key: &str, row: T) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.rows.contains_key(old_key),
+            "表 {} replace：旧行键 {old_key} 不存在，拒绝静默新建",
+            self.spec.id
+        );
+        self.write_row(row, Some(old_key.to_string()))
+    }
+
+    fn write_row(&mut self, row: T, old_key: Option<String>) -> anyhow::Result<()> {
+        // 防线②：校验先于一切变更 —— 失败时 rows 与 columns 均未被触碰。
+        row.check_row()?;
+
         let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(self.spec.pk.len());
         for column in self.spec.pk {
             let col = self.parse_column(column)?;
@@ -281,6 +319,30 @@ impl<T: DataTable> Table<T> {
             })?;
             fresh.push((column, value.to_string()));
         }
+
+        // 碰撞拒绝：新键已属于别的行（old_key 自替换、同键重写除外）。
+        anyhow::ensure!(
+            old_key.is_some() || !self.rows.contains_key(&row_key),
+            "表 {} 行键 {row_key} 已被另一行占用，upsert 拒绝跨行覆盖；改主键请走 replace",
+            self.spec.id
+        );
+
+        // 改主键迁移（replace 专用）：旧行条目连同其全部索引一起消失。
+        if let Some(stale) = &old_key
+            && stale != &row_key
+        {
+            self.rows.remove(stale);
+            for index in self.columns.values_mut() {
+                index.remove_row(stale);
+            }
+        }
+
+        // 防线①：先清旧后插新 —— 同一行改已索引列不残留假阳性。
+        for column in self.indexed.iter().copied() {
+            if let Some(index) = self.columns.get_mut(column) {
+                index.remove_row(&row_key);
+            }
+        }
         for (column, value) in &fresh {
             if let Some(index) = self.columns.get_mut(*column) {
                 index.push(&row_key, ColVal::Text(value.as_str()));
@@ -288,6 +350,17 @@ impl<T: DataTable> Table<T> {
         }
         self.rows.insert(row_key, row);
         Ok(())
+    }
+
+    /// 内核删除入口：行与已索引取值一起消失，不留悬空索引（外键假阳性的另一半来源）。
+    /// 行不存在时返回 `false`，但索引清理照常完成（幂等）。
+    pub fn delete(&mut self, row_key: &str) -> bool {
+        for column in self.indexed.iter().copied() {
+            if let Some(index) = self.columns.get_mut(column) {
+                index.remove_row(row_key);
+            }
+        }
+        self.rows.remove(row_key).is_some()
     }
 
     /// 为 `Spec` 声明涉及的全部列建索引：本表 pk + 本表外键列 + 被别表引用的目标列。
@@ -633,7 +706,7 @@ pub fn check_registry_shape() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use account::amount::{Price, Quantity};
-    use crate::domain::{Account, Asset, Position, Security, User};
+    use crate::domain::{Account, Asset, Order, Position, Security, Trade, User};
     use crate::mem::Snapshot;
 
     fn fixture_root() -> std::path::PathBuf {
@@ -665,7 +738,15 @@ mod tests {
     fn table_ids_are_unique_and_match_files() {
         check_registry_shape().unwrap();
 
-        let implemented = [User::ID, Account::ID, Security::ID, Asset::ID, Position::ID];
+        let implemented = [
+            User::ID,
+            Account::ID,
+            Security::ID,
+            Asset::ID,
+            Position::ID,
+            Order::ID,
+            Trade::ID,
+        ];
         let declared: Vec<&'static str> = TABLES.iter().map(|spec| spec.id).collect();
         for id in implemented {
             assert!(declared.contains(&id), "{id} 实现了 DataTable 但未在 TABLES 登记");
@@ -884,5 +965,72 @@ mod tests {
         assert_covered::<Security>("dict_security");
         assert_covered::<Asset>("account_asset");
         assert_covered::<Position>("position");
+        assert_covered::<Order>("orders");
+        assert_covered::<Trade>("trades");
+    }
+
+    /// 1.9 防线①：同一行二次写入改已索引列后，旧值不得再被 `has` 命中，
+    /// 索引 `(key, value)` 对数与实际行数一致（append-only 时代会双双失真）。
+    #[test]
+    fn upsert_clears_old_index_values_on_reindex_column() {
+        let mut positions = load_table::<Position>(&fixture_root()).unwrap();
+        let key = composite_key_str(&["A001", "09018"]);
+        let original = positions.get(&key).unwrap().clone();
+        let before_rows = positions.len();
+
+        // 改主键列 symbol 走 replace：行键迁移，旧值 09018 从索引消失。
+        let renamed = Position {
+            symbol: "600000".to_string(),
+            ..original.clone()
+        };
+        positions.replace(&key, renamed).unwrap();
+        assert!(!positions.has("symbol", "09018"), "旧索引值应被清除");
+        assert!(positions.has("symbol", "600000"), "新索引值应命中");
+        assert!(!positions.contains_key(&key), "行键随主键列迁移");
+        assert_eq!(positions.len(), before_rows, "迁移是移动不是复制，行数不变");
+
+        // 改回原样仍用 replace（当前键 → 原键）。
+        positions
+            .replace(&composite_key_str(&["A001", "600000"]), original)
+            .unwrap();
+        assert!(positions.has("symbol", "09018"));
+        assert_eq!(positions.stat().rows, positions.len());
+
+        // upsert 撞已有行键（别的身份）即拒绝，行与索引不被触碰 —— 杜绝静默覆盖。
+        let squatter = Position {
+            account_id: "A001".to_string(),
+            symbol: "09018".to_string(),
+            quantity: Quantity::from_units(1),
+            available_qty: Quantity::from_units(0),
+            avg_cost: Price::from_units(1),
+        };
+        assert!(positions.upsert(squatter).is_err(), "upsert 应拒绝跨行覆盖");
+        assert_eq!(positions.len(), before_rows);
+        assert!(positions.get(&key).unwrap().quantity.units() > 1, "被占行的数据不得被改");
+
+        // delete 同步清行清索引，不留悬空对。
+        assert!(positions.delete(&key));
+        assert!(!positions.has("symbol", "09018"), "删除后索引不应残留");
+        assert!(!positions.delete(&key), "二次删除返回 false");
+    }
+
+    /// 1.10 防线②：违反 `check_row` 的行经 `upsert` 写入必 `Err`，
+    /// 且表内容与索引均未被触碰（校验先于一切变更）。
+    #[test]
+    fn upsert_enforces_check_row_before_any_mutation() {
+        let mut positions = load_table::<Position>(&fixture_root()).unwrap();
+        let before_rows = positions.len();
+
+        // Position 的不变量：quantity >= available_qty。
+        let bad = Position {
+            account_id: "A001".to_string(),
+            symbol: "999999".to_string(),
+            quantity: Quantity::from_units(100),
+            available_qty: Quantity::from_units(200),
+            avg_cost: Price::from_units(10_000),
+        };
+        assert!(positions.upsert(bad).is_err(), "非法行应被 check_row 拒绝");
+        assert_eq!(positions.len(), before_rows, "失败不得碰行图");
+        assert!(!positions.has("symbol", "999999"), "失败不得碰索引");
     }
 }

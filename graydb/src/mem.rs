@@ -5,7 +5,8 @@ use std::path::Path;
 
 use account::amount::{Money, Price, Quantity, Rounding, notional};
 
-use crate::domain::{Account, AccountStatus, Asset, Position, Security, User};
+use crate::domain::{Account, AccountStatus, Asset, Order, Position, Security, Trade, User};
+use crate::engine::RejectReason;
 use crate::tables::{
     DataTable, FkIndex, Table, TableStat, check_registry_shape, composite_key_str, load_table,
     save_table,
@@ -25,6 +26,9 @@ pub struct Snapshot {
     pub assets: Table<Asset>,
     /// key = `composite_key(["account_id", "symbol"])`，拼法唯一。
     pub positions: Table<Position>,
+    /// 内核写路径（阶段 1.1）：委托与成交。日初为空，运行期 `upsert` 写入。
+    pub orders: Table<Order>,
+    pub trades: Table<Trade>,
     /// 加载时的数据源标识（将来是 `lsn`，现在是文件目录）。
     pub source: String,
 }
@@ -46,6 +50,8 @@ impl Snapshot {
             securities: load_table::<Security>(root)?,
             assets: load_table::<Asset>(root)?,
             positions: load_table::<Position>(root)?,
+            orders: load_table::<Order>(root)?,
+            trades: load_table::<Trade>(root)?,
             source: root.display().to_string(),
         };
         snapshot.check_integrity()?;
@@ -115,6 +121,12 @@ impl Snapshot {
         if self.positions.degraded {
             degraded.push(Position::ID);
         }
+        if self.orders.degraded {
+            degraded.push(Order::ID);
+        }
+        if self.trades.degraded {
+            degraded.push(Trade::ID);
+        }
         degraded
     }
 
@@ -142,6 +154,8 @@ impl Snapshot {
         index.register(&self.securities);
         index.register(&self.assets);
         index.register(&self.positions);
+        index.register(&self.orders);
+        index.register(&self.trades);
         index
     }
 
@@ -171,49 +185,66 @@ impl Snapshot {
 
     /// 日终 dump 回 JSON —— 与 `load` 对偶，路径同样取自 `Spec::file`。
     ///
-    /// 目前只回写 `Kind::State` 的两张表；新增可变表时在此多一行（与 `TABLES` 同步）。
+    /// 只回写 `Kind::State` 的四张表（资金/持仓/订单/成交）；新增可变表时在此多一行。
     pub fn save(&self, data_root: impl AsRef<Path>) -> anyhow::Result<()> {
         let root = data_root.as_ref();
         save_table(&self.assets, root)?;
         save_table(&self.positions, root)?;
+        save_table(&self.orders, root)?;
+        save_table(&self.trades, root)?;
         Ok(())
     }
 }
 
 /// 资金变动的一切入口都走这里，保证 `available + frozen` 守恒。
-/// 返回 `false` 表示可用资金不足，调用方必须拒单 —— 不允许负余额出现。
-pub fn try_freeze(asset: &mut Asset, amount: Money) -> bool {
-    let Some(frozen) = asset.frozen.checked_add(amount) else {
-        return false;
-    };
-    let Some(available) = asset.available.checked_sub(amount) else {
-        return false;
-    };
+///
+/// 阶段 1.2：返回值从 `bool` 升级为 `Result<(), RejectReason>` —— 原来的 `false` 把
+/// 「可用不足」和「冻结账目被写坏」压成同一个信号，调用方无从区分该拒单还是该停内核。
+/// 两个分支都保证零状态变化：先算出两个新值，全部算式成立才一次性写回。
+///
+/// 为什么要额外过一道 `is_negative`：`Amount::checked_sub` 只挡算术溢出，
+/// 减成负数是 `Some(负值)` —— 金额层允许负（盈亏需要），余额语义层不允许。
+pub fn try_freeze(asset: &mut Asset, amount: Money) -> Result<(), RejectReason> {
+    let frozen = asset
+        .frozen
+        .checked_add(amount)
+        .ok_or(RejectReason::InsufficientFunds)?;
+    let available = asset
+        .available
+        .checked_sub(amount)
+        .filter(|value| !value.is_negative())
+        .ok_or(RejectReason::InsufficientFunds)?;
     asset.frozen = frozen;
     asset.available = available;
-    true
+    Ok(())
 }
 
 /// 冻结转已用（成交扣款）：冻结金额减少，成交额离开账户体系。
-pub fn settle_frozen_out(asset: &mut Asset, amount: Money) -> bool {
-    let Some(frozen) = asset.frozen.checked_sub(amount) else {
-        return false;
-    };
+/// 冻结额不够说明上游按限价冻结算错了 —— 属状态缺陷，不是市场原因，返回 `FrozenUnderflow`。
+pub fn settle_frozen_out(asset: &mut Asset, amount: Money) -> Result<(), RejectReason> {
+    let frozen = asset
+        .frozen
+        .checked_sub(amount)
+        .filter(|value| !value.is_negative())
+        .ok_or(RejectReason::FrozenUnderflow)?;
     asset.frozen = frozen;
-    true
+    Ok(())
 }
 
-/// 解冻回可用（撤单/废单）。
-pub fn unfreeze(asset: &mut Asset, amount: Money) -> bool {
-    let Some(available) = asset.available.checked_add(amount) else {
-        return false;
-    };
-    let Some(frozen) = asset.frozen.checked_sub(amount) else {
-        return false;
-    };
-    asset.available = available;
+/// 解冻回可用（撤单/废单/成交价优于限价）。任一算式失败都意味着冻结账目不平。
+pub fn unfreeze(asset: &mut Asset, amount: Money) -> Result<(), RejectReason> {
+    let frozen = asset
+        .frozen
+        .checked_sub(amount)
+        .filter(|value| !value.is_negative())
+        .ok_or(RejectReason::FrozenUnderflow)?;
+    let available = asset
+        .available
+        .checked_add(amount)
+        .ok_or(RejectReason::FrozenUnderflow)?;
     asset.frozen = frozen;
-    true
+    asset.available = available;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,6 +264,9 @@ mod tests {
         assert_eq!(snap.securities.len(), 2);
         assert_eq!(snap.assets.len(), 3);
         assert_eq!(snap.positions.len(), 2);
+        // 阶段 1 的两张流水表：日初为空（`expected_rows = 0`），只能由内核写入。
+        assert_eq!(snap.orders.len(), 0);
+        assert_eq!(snap.trades.len(), 0);
         assert!(snap.check_integrity().is_ok());
     }
 
@@ -255,16 +289,32 @@ mod tests {
         let before = asset.available.checked_add(asset.frozen).unwrap();
 
         // 冻结 7202.00 元
-        assert!(try_freeze(&mut asset, Money::from_units(720_200)));
+        assert!(try_freeze(&mut asset, Money::from_units(720_200)).is_ok());
         assert_eq!(asset.available.checked_add(asset.frozen).unwrap(), before);
 
-        // 超额冻结必须被拒绝，且原值不变
-        let untouched = asset;
-        assert!(!try_freeze(&mut untouched.clone(), Money::from_units(i64::MAX)));
+        // 超额冻结被拒，且零状态变化（1.2：结构化原因取代丢信息的 `false`）
+        let mut oversized = asset.clone();
         assert_eq!(
-            untouched.available,
-            snap.asset("A001").unwrap().available.checked_sub(Money::from_units(720_200)).unwrap()
+            try_freeze(&mut oversized, Money::from_units(i64::MAX)),
+            Err(RejectReason::InsufficientFunds)
         );
+        assert_eq!(oversized.available, asset.available);
+        assert_eq!(oversized.frozen, asset.frozen);
+
+        // 解冻回原额；解冻多于冻结额是账目不平，不是市场原因
+        assert!(unfreeze(&mut asset, Money::from_units(720_200)).is_ok());
+        assert_eq!(asset.available.checked_add(asset.frozen).unwrap(), before);
+        assert!(asset.frozen.is_zero());
+        assert_eq!(
+            settle_frozen_out(&mut asset, Money::from_units(1)),
+            Err(RejectReason::FrozenUnderflow),
+            "冻结已清空，再扣一分都是账目不平（`checked_sub` 允许负值，这里必须拦）"
+        );
+        assert_eq!(
+            unfreeze(&mut asset, Money::from_units(1)),
+            Err(RejectReason::FrozenUnderflow)
+        );
+        assert!(asset.frozen.is_zero() && asset.available.checked_add(asset.frozen).unwrap() == before);
     }
 
     /// 主键拼法唯一：`position_key` 已并入 `tables::composite_key`，与 `Spec::pk` 共用一处定义。

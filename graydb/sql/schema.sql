@@ -52,3 +52,30 @@ CREATE TABLE position (
     avg_cost       numeric(20,4) NOT NULL,     -- → Price
     PRIMARY KEY (account_id, symbol)
 );
+
+-- 内核写路径（阶段 1.1）：orders / trades 是 Kind::State，内核独占写。
+-- order_id 同时是幂等键（阶段 1.4）：重复提交返回原单，不重复冻结。
+CREATE TABLE orders (
+    order_id    text          PRIMARY KEY,
+    account_id  text          NOT NULL,
+    symbol      text          NOT NULL,
+    side        text          NOT NULL,         -- 业务枚举 Side
+    price       numeric(20,4) NOT NULL,         -- → Price
+    quantity    numeric(20,0) NOT NULL,         -- → Quantity
+    filled_qty  numeric(20,0) NOT NULL,         -- → Quantity
+    status      text          NOT NULL,         -- 业务枚举 OrderStatus
+    created_at  timestamptz,                    -- ISO8601 String（遗留 7：时间策略先定字符串）
+    seq         bigint        NOT NULL          -- 内核全局序号（阶段 1.3）
+);
+
+CREATE TABLE trades (
+    trade_id   text          PRIMARY KEY,
+    order_id   text          NOT NULL,          -- 外键 → orders.order_id
+    account_id text          NOT NULL,
+    symbol     text          NOT NULL,
+    side       text          NOT NULL,          -- 业务枚举 Side
+    price      numeric(20,4) NOT NULL,          -- → Price
+    quantity   numeric(20,0) NOT NULL,          -- → Quantity
+    amount     numeric(28,2) NOT NULL,          -- → Money = notional(price, qty)
+    seq        bigint        NOT NULL
+);

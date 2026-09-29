@@ -855,12 +855,30 @@ mod tests {
     }
 
     /// 演示 schema 与升级后的解析器行为兼容（提取类型不含约束词）。
+    /// 先逐张断言「声明过的都在」，再校总数 —— 新增表时只需往清单里加一个名字。
     #[test]
     fn parses_demo_schema() {
         let tables = parse_schema(&graydb_sql("schema.sql")).unwrap();
-        assert_eq!(tables.len(), 5);
+        for id in [
+            "user_info",
+            "account_info",
+            "dict_security",
+            "account_asset",
+            "position",
+            "orders",
+            "trades",
+        ] {
+            assert!(tables.contains_key(id), "演示 schema 缺表 {id}");
+        }
+        assert_eq!(tables.len(), 7, "除声明的 7 张外不该解析出别的东西");
         let asset = &tables["account_asset"];
         assert!(asset.iter().any(|c| c.name == "frozen"));
+        // 阶段 1 的流水表：numeric 标度按 DDL 原样带出，映射表才能分派到 Quantity/Price
+        let filled = tables["orders"]
+            .iter()
+            .find(|c| c.name == "filled_qty")
+            .expect("orders 缺少 filled_qty 列");
+        assert_eq!(filled.sql_type, "numeric(20,0)");
     }
 
     /// 整表 stub 搬表（[[stub]]）：去 tb_ 全名 Pascal 不撞车；无 row_id 即报错；Decimal 占位。

@@ -81,6 +81,44 @@ available_qty = "Quantity"
 avg_cost = "Price"
 
 # ---------------------------------------------------------------------------
+# 内核写路径（阶段 1.1）：orders / trades 从 DDL 登记，清掉遗留 9。
+# created_at = timestamptz → String（ISO8601，遗留 7 的裁决：时间先单点用字符串）；
+# seq = bigint → i64（与 ColVal::Int 同宽，将来进索引无转换）。
+# 日初为空表（expected_rows = 0）：数据由 engine 运行期 upsert 产生。
+# ---------------------------------------------------------------------------
+
+[[table]]
+id = "orders"
+struct = "Order"
+file = "state/order.json"
+kind = "State"
+policy = "Critical"
+pk = ["order_id"]
+fk = [["account_id", "account_info", "account_id"], ["symbol", "dict_security", "symbol"]]
+expected_rows = 0
+[table.types]
+side = "Side"
+price = "Price"
+quantity = "Quantity"
+filled_qty = "Quantity"
+status = "OrderStatus"
+
+[[table]]
+id = "trades"
+struct = "Trade"
+file = "state/trade.json"
+kind = "State"
+policy = "Critical"
+pk = ["trade_id"]
+fk = [["order_id", "orders", "order_id"], ["account_id", "account_info", "account_id"], ["symbol", "dict_security", "symbol"]]
+expected_rows = 0
+[table.types]
+side = "Side"
+price = "Price"
+quantity = "Quantity"
+amount = "Money"
+
+# ---------------------------------------------------------------------------
 # 真实表（jzdb_prod，pg_dump 产物驱动）
 # ---------------------------------------------------------------------------
 
