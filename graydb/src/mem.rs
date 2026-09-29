@@ -7,7 +7,8 @@ use account::amount::{Money, Price, Quantity, Rounding, notional};
 
 use crate::domain::{Account, AccountStatus, Asset, Position, Security, User};
 use crate::tables::{
-    DataTable, FkIndex, Table, TableStat, check_registry_shape, composite_key, load_table, save_table,
+    DataTable, FkIndex, Table, TableStat, check_registry_shape, composite_key_str, load_table,
+    save_table,
 };
 
 /// 一次性载入的全部主数据 —— 对应「日初加载进内存」的边界。
@@ -63,17 +64,14 @@ impl Snapshot {
     /// 这类「聚合型」不变量既不属于任何单行，也不适合声明成外键，故留在 `mem.rs`。
     pub fn check_valuation(&self) -> anyhow::Result<()> {
         let mut expected: HashMap<String, Money> = HashMap::new();
-        for position in self.positions.rows().values() {
+        for (key, position) in self.positions.rows() {
             let value: Money = notional(
                 Price::from_units(position.avg_cost.units()),
                 Quantity::from_units(position.quantity.units()),
                 Rounding::MidpointAwayFromZero,
             )
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "持仓 {} 市值计算溢出",
-                    composite_key(&position.pk_parts())
-                )
+                anyhow::anyhow!("持仓 {key} 市值计算溢出")
             })?;
             let entry = expected.entry(position.account_id.clone()).or_insert(Money::ZERO);
             *entry = entry
@@ -154,7 +152,7 @@ impl Snapshot {
 
     #[must_use]
     pub fn position(&self, account_id: &str, symbol: &str) -> Option<&Position> {
-        self.positions.get(&composite_key(&[account_id, symbol]))
+        self.positions.get(&composite_key_str(&[account_id, symbol]))
     }
 
     #[must_use]
@@ -272,7 +270,7 @@ mod tests {
     /// 主键拼法唯一：`position_key` 已并入 `tables::composite_key`，与 `Spec::pk` 共用一处定义。
     #[test]
     fn composite_key_is_stable_and_matches_json_layout() {
-        assert_eq!(composite_key(&["A001", "09018"]), "A001:09018");
+        assert_eq!(composite_key_str(&["A001", "09018"]), "A001:09018");
         let snap = snapshot();
         assert!(snap.position("A001", "09018").is_some());
         assert!(snap.position("A001", "600000").is_none());

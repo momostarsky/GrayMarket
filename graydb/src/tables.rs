@@ -3,9 +3,10 @@
 //! 声明与类型通过 `DataTable::ID` 互相锚定：
 //! - 漏写 `impl DataTable` → 泛型约束不满足，编译失败；
 //! - 漏登记 `Spec` → 加载期 `unknown table` 报错 + 守护测试失败；
-//! - 主键顺序 / 列名写错 → 加载期机械比对 `pk_parts()` 与 `Spec::pk` 即暴露。
+//! - 主键列名写错 / `column` 未覆盖声明列 → 加载期按 `Spec::pk` 逐列取值拼键即暴露。
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -114,30 +115,63 @@ pub fn spec_of(id: &str) -> Option<&'static Spec> {
     TABLES.iter().find(|spec| spec.id == id)
 }
 
-/// 复合主键的唯一拼法，取代散落各处的 `format!("{a}:{b}")` / `position_key`。
+/// 列取值：文本列借用（零拷贝），整型列内联 `Copy`。
+///
+/// 这是「列值」在冷路径上的唯一载体，取代旧的 `&str`-only 约束：
+/// 整型 / `Amount`（取 `.units()`）主键因此可进注册中心，而读侧仍不分配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColVal<'a> {
+    /// 文本列取值，借用自行内 `String`/`&str`，零拷贝。
+    Text(&'a str),
+    /// 整型列取值（含 `Amount::units()`），内联 `Copy`，零拷贝。
+    Int(i64),
+}
+
+impl fmt::Display for ColVal<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ColVal::Text(s) => write!(f, "{s}"),
+            ColVal::Int(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+/// 复合主键的唯一拼法（[ColVal] 段），取代散落各处的 `format!("{a}:{b}")` / `position_key`。
 #[must_use]
-pub fn composite_key(parts: &[&str]) -> String {
+pub fn composite_key(parts: &[ColVal<'_>]) -> String {
     let mut key = String::new();
     for (idx, part) in parts.iter().enumerate() {
         if idx > 0 {
             key.push(':');
         }
-        key.push_str(part);
+        // 文本段直接 push_str 零额外分配；整型段本就必须转十进制，仅此一次分配。
+        match part {
+            ColVal::Text(s) => key.push_str(s),
+            ColVal::Int(n) => key.push_str(&n.to_string()),
+        }
     }
     key
 }
 
-/// 行与声明的绑定：类型侧只需回答「我是谁、我的键在哪、我这一行合法吗」。
+/// 纯文本主键的便捷入口：把 `&str` 段包成 [ColVal::Text] 后转 [composite_key]，
+/// 让字面量调用点（演示 / 测试）不强制手写枚举。
+#[must_use]
+pub fn composite_key_str(parts: &[&str]) -> String {
+    composite_key(&parts.iter().copied().map(ColVal::Text).collect::<Vec<_>>())
+}
+
+/// 行与声明的绑定：类型侧只需回答「我是哪张表、某一列取值是什么、我这一行合法吗」。
+/// 行键不再手写，由 `Spec::pk` × `column` 在加载期现算。
 pub trait DataTable {
     /// 必须等于某个 `Spec::id`。
     const ID: &'static str;
 
     /// 按列名取值。必须覆盖本表 `Spec::pk` 的列，以及被别表 `fk` 引用为目标的列；
     /// 其余列返回 `None` 即可（冷路径，不进撮合）。
-    fn column(&self, name: &'static str) -> Option<&str>;
-
-    /// 主键各列取值，顺序必须与 `Spec::pk` 完全一致。
-    fn pk_parts(&self) -> Vec<&str>;
+    ///
+    /// 文本列返回 [`ColVal::Text`]（借用零拷贝），整型 / `Amount` 主键返回 [`ColVal::Int`]，
+    /// 这是整型主键得进注册中心而不破坏零拷贝契约的关键。
+    fn column(&self, name: &'static str) -> Option<ColVal<'_>>;
 
     /// 单行不变量（不跨表）。跨表不变量由 `Spec::fk` 声明 + `FkIndex` 承担。
     fn check_row(&self) -> anyhow::Result<()> {
@@ -158,9 +192,10 @@ impl ColumnIndex {
         self.values.contains(value)
     }
 
-    fn push(&mut self, row_key: &str, value: &str) {
-        self.values.insert(value.to_string());
-        self.rows.push((row_key.to_string(), value.to_string()));
+    fn push(&mut self, row_key: &str, value: ColVal<'_>) {
+        let value = value.to_string();
+        self.rows.push((row_key.to_string(), value.clone()));
+        self.values.insert(value);
     }
 
     /// 第一个「本表出现、目标表不存在」的取值及其行主键。
@@ -234,16 +269,15 @@ impl<T: DataTable> Table<T> {
         }
     }
 
-    /// 内核写入唯一入口（阶段 1）：主键由 `pk_parts` 现算，行与列索引一起更新。
+    /// 内核写入唯一入口（阶段 1）：主键由 `Spec::pk` × `column` 现算，行与列索引一起更新。
     pub fn upsert(&mut self, row: T) -> anyhow::Result<()> {
-        let parts = row.pk_parts();
-        anyhow::ensure!(
-            parts.len() == self.spec.pk.len(),
-            "表 {} 主键段数不符: 声明 {:?}，实现 {} 段",
-            self.spec.id,
-            self.spec.pk,
-            parts.len()
-        );
+        let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(self.spec.pk.len());
+        for column in self.spec.pk {
+            let value = row.column(column).ok_or_else(|| {
+                anyhow::anyhow!("表 {} 缺少主键列 {column}", self.spec.id)
+            })?;
+            parts.push(value);
+        }
         let row_key = composite_key(&parts);
 
         let mut fresh: Vec<(&'static str, String)> = Vec::with_capacity(self.indexed.len());
@@ -255,7 +289,7 @@ impl<T: DataTable> Table<T> {
         }
         for (column, value) in &fresh {
             if let Some(index) = self.columns.get_mut(*column) {
-                index.push(&row_key, value);
+                index.push(&row_key, ColVal::Text(value.as_str()));
             }
         }
         self.rows.insert(row_key, row);
@@ -394,38 +428,21 @@ fn degrade<T>(
     }
 }
 
-/// 机械校验三件事：`JSON 外层键` == `按 Spec::pk 取值拼键` == `pk_parts() 拼键`，
-/// 顺带跑一遍 `check_row`。主键列名写错、顺序写反、手拼键串在此全部当场失败。
+/// 机械校验两件事：`按 Spec::pk 逐列 column() 取值拼键` 成功，且 == `JSON 外层键`，
+/// 顺带跑一遍 `check_row`。主键列名写错、`column` 未暴露声明列在此当场失败。
 fn verify_primary_keys<T: DataTable>(table: &Table<T>) -> anyhow::Result<()> {
     for (json_key, row) in &table.rows {
-        let parts = row.pk_parts();
-        anyhow::ensure!(
-            parts.len() == table.spec.pk.len(),
-            "表 {} 主键段数不符: 声明 {:?}，实现 {} 段",
-            table.spec.id,
-            table.spec.pk,
-            parts.len()
-        );
-
-        let mut declared_parts: Vec<&str> = Vec::with_capacity(table.spec.pk.len());
+        let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(table.spec.pk.len());
         for column in table.spec.pk {
             let value = row.column(column).ok_or_else(|| {
                 anyhow::anyhow!("表 {} 缺少主键列 {column}", table.spec.id)
             })?;
-            declared_parts.push(value);
+            parts.push(value);
         }
-
-        let declared = composite_key(&declared_parts);
-        let computed = composite_key(&parts);
+        let declared = composite_key(&parts);
         anyhow::ensure!(
-            declared == computed,
-            "表 {} 主键实现与声明不符: 声明 {:?} → {declared}，实现 → {computed}",
-            table.spec.id,
-            table.spec.pk
-        );
-        anyhow::ensure!(
-            json_key == &computed,
-            "表 {} 的 JSON 键 {json_key} 与复合主键 {computed} 不一致",
+            json_key == &declared,
+            "表 {} 的 JSON 键 {json_key} 与复合主键 {declared} 不一致",
             table.spec.id
         );
         row.check_row()?;
@@ -754,5 +771,56 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("复合主键"), "应报主键不符: {err}");
+    }
+
+    /// 契约修订证明：`composite_key` 混合段（文本 + 整型）拼接，`Int` 段十进制稳定。
+    #[test]
+    fn composite_key_mixed_segments_render_stably() {
+        assert_eq!(composite_key(&[ColVal::Text("A001"), ColVal::Int(7)]), "A001:7");
+        assert_eq!(ColVal::Int(-42).to_string(), "-42");
+        assert_eq!(ColVal::Text("09018").to_string(), "09018");
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct IntDict {
+        id: i64,
+        label: String,
+    }
+
+    impl DataTable for IntDict {
+        const ID: &'static str = "int_dict";
+        fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
+            match name {
+                "id" => Some(ColVal::Int(self.id)),
+                _ => None,
+            }
+        }
+    }
+
+    /// 契约修订核心：`i64` 主键能走 `column → ColVal::Int → 行键/索引` 全链路，
+    /// 且读侧不经 `&str` —— 证明「主键只能文本」的天花板已解除。
+    #[test]
+    fn int_primary_key_is_supported_end_to_end() {
+        let root = temp_dir("int-pk");
+        std::fs::write(
+            root.join("int_dict.json"),
+            r#"{"1001":{"id":1001,"label":"A"},"1002":{"id":1002,"label":"B"}}"#,
+        )
+        .unwrap();
+
+        let spec = leaked_spec(|patch| {
+            patch.id = "int_dict";
+            patch.file = "int_dict.json";
+            patch.pk = &["id"];
+            patch.fk = &[];
+            patch.policy = LoadPolicy::Critical;
+            patch.expected_rows = Some(2);
+        });
+        let table = load_specified_table::<IntDict>(&root, spec).unwrap();
+
+        assert!(table.contains_key("1001"), "整型主键应拼成十进制行键");
+        assert!(table.has("id", "1002"), "列索引应命中整型取值");
+        assert!(!table.has("id", "9999"), "不存在的整型取值应判否");
     }
 }

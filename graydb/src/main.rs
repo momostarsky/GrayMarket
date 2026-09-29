@@ -9,7 +9,7 @@ use account::amount::{Money, Price, Quantity, Rounding, notional};
 
 use crate::domain::Security;
 use crate::mem::Snapshot;
-use crate::tables::{DataTable, composite_key};
+use crate::tables::{DataTable, composite_key_str};
 
 fn main() {
     println!("Hello, GrayDB!");
@@ -78,9 +78,8 @@ fn demo_iterate(snapshot: &Snapshot) {
 
     println!("\n[3] 遍历值 + 沿外键点查另一张表");
     // 只要值不要键：`values()`；键值都要：`rows().iter()`。
-    for position in snapshot.positions.rows().values() {
-        // 复合主键的表：段由 `pk_parts()` 给出，拼法唯一走 `composite_key`，不自己拼 `format!`。
-        let key = composite_key(&position.pk_parts());
+    for (key, position) in snapshot.positions.rows() {
+        // 行键由加载期按 `Spec::pk` 现算（impl 不再手写 `pk_parts`），这里直接用 map 键。
         // 声明式外键已保证引用得到，这里不需要 `ok_or_else` 兼容缺失。
         let security = snapshot.securities.get(&position.symbol).expect("字典缺此证券");
         println!(
@@ -93,7 +92,7 @@ fn demo_iterate(snapshot: &Snapshot) {
     // 单列主键：`get` 直接给主键值（入参是行键，不是字段名）。
     println!("  securities.get(\"09018\")            → {}", snapshot.securities.get("09018").is_some());
     // 复合主键：必须用 `composite_key` 拼，段顺序按 `Spec::pk`（`account_id` 在前）。
-    let hit = snapshot.positions.get(&composite_key(&["A001", "09018"]));
+    let hit = snapshot.positions.get(&composite_key_str(&["A001", "09018"]));
     println!("  positions.get(composite_key)     → {}", hit.is_some());
     // `Snapshot` 上的语义化封装，本质同上，业务代码优先用它。
     println!("  snapshot.position(A001, 09018)   → {}", snapshot.position("A001", "09018").is_some());

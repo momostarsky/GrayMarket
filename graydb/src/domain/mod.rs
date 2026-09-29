@@ -1,5 +1,5 @@
 use account::amount::{Money, Price, Quantity};
-use crate::tables::DataTable;
+use crate::tables::{ColVal, DataTable};
 use serde::{Deserialize, Serialize};
 
 /// 证券字典 —— 未来表: dict_security
@@ -126,23 +126,20 @@ pub enum OrderStatus {
 // ---------------------------------------------------------------------------
 // 表声明绑定（阶段 0.5）
 //
-// 每个 `impl DataTable` 只回答三件事：我是哪张表、我的主键在哪几列、
-// 我这一行自己合法吗（不跨表）。`column` 只需覆盖 `Spec::pk` 与被外键引用的列，
-// 其余列一律 `None` —— 它在冷路径，不进撮合。
+// 每个 `impl DataTable` 只回答两件事：我是哪张表、我这一行自己合法吗（不跨表）。
+// 列取值经 `column` 暴露（文本列 `ColVal::Text` 零拷贝），只需覆盖 `Spec::pk`
+// 与被外键引用的列，其余列一律 `None` —— 它在冷路径，不进撮合。
+// 主键拼法由 `Spec::pk` 单方定义，不再在类型侧手写 `pk_parts`。
 // ---------------------------------------------------------------------------
 
 impl DataTable for User {
     const ID: &'static str = "user_info";
 
-    fn column(&self, name: &'static str) -> Option<&str> {
+    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
         match name {
-            "user_id" => Some(&self.user_id),
+            "user_id" => Some(ColVal::Text(&self.user_id)),
             _ => None,
         }
-    }
-
-    fn pk_parts(&self) -> Vec<&str> {
-        vec![&self.user_id]
     }
 
     fn check_row(&self) -> anyhow::Result<()> {
@@ -155,16 +152,12 @@ impl DataTable for User {
 impl DataTable for Account {
     const ID: &'static str = "account_info";
 
-    fn column(&self, name: &'static str) -> Option<&str> {
+    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
         match name {
-            "account_id" => Some(&self.account_id),
-            "user_id" => Some(&self.user_id),
+            "account_id" => Some(ColVal::Text(&self.account_id)),
+            "user_id" => Some(ColVal::Text(&self.user_id)),
             _ => None,
         }
-    }
-
-    fn pk_parts(&self) -> Vec<&str> {
-        vec![&self.account_id]
     }
 
     fn check_row(&self) -> anyhow::Result<()> {
@@ -181,15 +174,11 @@ impl DataTable for Account {
 impl DataTable for Security {
     const ID: &'static str = "dict_security";
 
-    fn column(&self, name: &'static str) -> Option<&str> {
+    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
         match name {
-            "symbol" => Some(&self.symbol),
+            "symbol" => Some(ColVal::Text(&self.symbol)),
             _ => None,
         }
-    }
-
-    fn pk_parts(&self) -> Vec<&str> {
-        vec![&self.symbol]
     }
 
     fn check_row(&self) -> anyhow::Result<()> {
@@ -210,15 +199,11 @@ impl DataTable for Security {
 impl DataTable for Asset {
     const ID: &'static str = "account_asset";
 
-    fn column(&self, name: &'static str) -> Option<&str> {
+    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
         match name {
-            "account_id" => Some(&self.account_id),
+            "account_id" => Some(ColVal::Text(&self.account_id)),
             _ => None,
         }
-    }
-
-    fn pk_parts(&self) -> Vec<&str> {
-        vec![&self.account_id]
     }
 
     /// 资金非负是原 `check_integrity` 的手写循环，现在是单行不变量。
@@ -241,17 +226,12 @@ impl DataTable for Asset {
 impl DataTable for Position {
     const ID: &'static str = "position";
 
-    fn column(&self, name: &'static str) -> Option<&str> {
+    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
         match name {
-            "account_id" => Some(&self.account_id),
-            "symbol" => Some(&self.symbol),
+            "account_id" => Some(ColVal::Text(&self.account_id)),
+            "symbol" => Some(ColVal::Text(&self.symbol)),
             _ => None,
         }
-    }
-
-    /// 顺序必须与 `Spec::pk = ["account_id", "symbol"]` 一致，加载时逐列核对。
-    fn pk_parts(&self) -> Vec<&str> {
-        vec![&self.account_id, &self.symbol]
     }
 
     fn check_row(&self) -> anyhow::Result<()> {
