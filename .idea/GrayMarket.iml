@@ -8,6 +8,7 @@
       <sourceFolder url="file://$MODULE_DIR$/graydb/graydb/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/graydb/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/store/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/codegen/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

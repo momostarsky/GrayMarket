@@ -49,66 +49,12 @@ pub struct Spec {
     pub expected_rows: Option<usize>,
 }
 
-/// 表清单 —— 唯一事实源。新增一张表 = 这里加一行 + `domain` 加一个 `impl DataTable`
-/// + `Snapshot` 加一个强类型字段（热路径零开销，见计划「刻意不做」）。
+/// 表清单 —— 唯一事实源，由 `codegen` 从 `sql/schema.sql` + `tables.toml` 生成（见 `crate::generated::TABLES`）。
 ///
-/// **顺序不构成硬约束**（外键允许成环），这里只按可读性排列；
-/// id / 文件唯一性与外键目标合法性由 `check_registry_shape` 守护。
-pub const TABLES: &[Spec] = &[
-    Spec {
-        id: "user_info",
-        file: "dict/user.json",
-        kind: Kind::Dict,
-        policy: LoadPolicy::Critical,
-        pk: &["user_id"],
-        fk: &[],
-        expected_rows: Some(3),
-    },
-    Spec {
-        id: "account_info",
-        file: "state/account.json",
-        kind: Kind::Dict,
-        policy: LoadPolicy::Critical,
-        pk: &["account_id"],
-        // 原先 `check_integrity` 里两个手写 for 循环，现在由声明表达：
-        // 账户必须属于一个存在的用户，且必须有一行资金记录。
-        fk: &[
-            ("user_id", "user_info", "user_id"),
-            ("account_id", "account_asset", "account_id"),
-        ],
-        expected_rows: Some(3),
-    },
-    Spec {
-        id: "dict_security",
-        file: "dict/security.json",
-        kind: Kind::Dict,
-        policy: LoadPolicy::Critical,
-        pk: &["symbol"],
-        fk: &[],
-        expected_rows: Some(2),
-    },
-    Spec {
-        id: "account_asset",
-        file: "state/asset.json",
-        kind: Kind::State,
-        policy: LoadPolicy::Critical,
-        pk: &["account_id"],
-        fk: &[("account_id", "account_info", "account_id")],
-        expected_rows: Some(3),
-    },
-    Spec {
-        id: "position",
-        file: "state/position.json",
-        kind: Kind::State,
-        policy: LoadPolicy::Critical,
-        pk: &["account_id", "symbol"],
-        fk: &[
-            ("account_id", "account_info", "account_id"),
-            ("symbol", "dict_security", "symbol"),
-        ],
-        expected_rows: Some(2),
-    },
-];
+/// 新增一张表：改 DDL / `tables.toml` 后跑 `cargo codegen`，再给 `Snapshot` 加一个强类型字段，
+/// 并在 `domain` 写一行 `impl RowValidator`（热路径零开销，见计划「刻意不做」）。
+/// `Spec` / `Kind` / `LoadPolicy` 的类型定义仍在上方，`check_registry_shape` 继续守护 id / 文件唯一性与外键目标合法性。
+pub use crate::generated::TABLES;
 
 #[must_use]
 pub fn spec_of(id: &str) -> Option<&'static Spec> {
@@ -160,22 +106,58 @@ pub fn composite_key_str(parts: &[&str]) -> String {
     composite_key(&parts.iter().copied().map(ColVal::Text).collect::<Vec<_>>())
 }
 
-/// 行与声明的绑定：类型侧只需回答「我是哪张表、某一列取值是什么、我这一行合法吗」。
+/// 每表的列枚举需实现的桥接：在「`Spec`/`FkIndex` 以列名为键」与「类型侧编译期可检查的枚举」之间往返。
+///
+/// 注册中心必须以列名字符串做跨表 join（外键指向别的表），故 `Spec::pk`/`Spec::fk` 仍是 `&'static str`；
+/// 本 trait 在加载边界把字符串翻译成枚举，`DataTable::column` 因此匹配枚举变体而非字面量。
+///
+/// 实现只需提供 `ALL` 与 `as_str`：列名字面量在全表仅出现一次（`as_str`），
+/// `parse` 由它反向派生，杜绝「`as_str` 与 `parse` 两处字面量各自写错」的不一致。
+/// `as_str`/`ALL` 的机械映射正是后续过程宏要生成的部分。
+pub trait ColumnName: Copy + PartialEq + Eq + core::fmt::Debug + 'static {
+    /// 全部列变体，供 [`ColumnName::parse`] 线性反查（列数有限，冷路径）。
+    const ALL: &'static [Self];
+
+    /// 枚举变体 → `Spec`/PG 列名（列名字面量的唯一来源）。
+    fn as_str(self) -> &'static str;
+
+    /// 列名 → 枚举变体；`Spec` 出现枚举未定义的列名时返回 `None`，加载期即暴露「声明与枚举不同步」。
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|col| col.as_str() == name)
+    }
+}
+
+/// 行不变量的业务钩子：codegen 生成的 `impl DataTable` 不携带手写校验，
+/// `check_row` 默认转调本 trait；人把单行不变量写在 `impl RowValidator for Xxx` 里。
+///
+/// 这样「样板（枚举/列名/主键）归生成器、不变量归人」各占一个 `impl` 块，互不抢占。
+#[allow(unused_variables)]
+pub trait RowValidator {
+    /// 默认无附加不变量；有跨列约束的类型覆写此方法。
+    fn validate_row(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// 行与声明的绑定：类型侧只需回答「我是哪张表、取哪一列的值是什么、我这一行合法吗」。
 /// 行键不再手写，由 `Spec::pk` × `column` 在加载期现算。
-pub trait DataTable {
+pub trait DataTable: RowValidator {
     /// 必须等于某个 `Spec::id`。
     const ID: &'static str;
 
-    /// 按列名取值。必须覆盖本表 `Spec::pk` 的列，以及被别表 `fk` 引用为目标的列；
-    /// 其余列返回 `None` 即可（冷路径，不进撮合）。
-    ///
-    /// 文本列返回 [`ColVal::Text`]（借用零拷贝），整型 / `Amount` 主键返回 [`ColVal::Int`]，
-    /// 这是整型主键得进注册中心而不破坏零拷贝契约的关键。
-    fn column(&self, name: &'static str) -> Option<ColVal<'_>>;
+    /// 本表列枚举：把「取哪一列」从字符串升级为编译期可检查的类型。
+    type Column: ColumnName;
 
-    /// 单行不变量（不跨表）。跨表不变量由 `Spec::fk` 声明 + `FkIndex` 承担。
+    /// 按列枚举取值。必须覆盖本表 `Spec::pk` 的列，以及被别表 `fk` 引用为目标的列；
+    /// 其余列（金额 / 数量等非 `ColVal` 可表达的列）返回 `None` 即可。
+    ///
+    /// 文本列返回 [`ColVal::Text`]（借用零拷贝），整型 / `Amount` 主键返回 [`ColVal::Int`]。
+    fn column(&self, col: Self::Column) -> Option<ColVal<'_>>;
+
+    /// 单行不变量（不跨表）：默认委托给 [`RowValidator::validate_row`]，跨表不变量由 `Spec::fk` + `FkIndex` 承担。
+    /// 手写表覆写此方法即可；生成表把逻辑写在 [`RowValidator`] 里，两者语义等价。
     fn check_row(&self) -> anyhow::Result<()> {
-        Ok(())
+        self.validate_row()
     }
 }
 
@@ -269,11 +251,22 @@ impl<T: DataTable> Table<T> {
         }
     }
 
+    /// 列名字符串 → 本表列枚举；`Spec` 出现枚举未定义的列名即报错（声明与枚举不同步的捕获点）。
+    fn parse_column(&self, name: &str) -> anyhow::Result<T::Column> {
+        T::Column::parse(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "表 {} 的列 {name} 未在其 Column 枚举定义（Spec 与枚举不同步）",
+                self.spec.id
+            )
+        })
+    }
+
     /// 内核写入唯一入口（阶段 1）：主键由 `Spec::pk` × `column` 现算，行与列索引一起更新。
     pub fn upsert(&mut self, row: T) -> anyhow::Result<()> {
         let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(self.spec.pk.len());
         for column in self.spec.pk {
-            let value = row.column(column).ok_or_else(|| {
+            let col = self.parse_column(column)?;
+            let value = row.column(col).ok_or_else(|| {
                 anyhow::anyhow!("表 {} 缺少主键列 {column}", self.spec.id)
             })?;
             parts.push(value);
@@ -282,7 +275,8 @@ impl<T: DataTable> Table<T> {
 
         let mut fresh: Vec<(&'static str, String)> = Vec::with_capacity(self.indexed.len());
         for column in self.indexed.iter().copied() {
-            let value = row.column(column).ok_or_else(|| {
+            let col = self.parse_column(column)?;
+            let value = row.column(col).ok_or_else(|| {
                 anyhow::anyhow!("表 {} 写入的行缺少已索引列 {column}", self.spec.id)
             })?;
             fresh.push((column, value.to_string()));
@@ -306,9 +300,10 @@ impl<T: DataTable> Table<T> {
         needed.dedup();
 
         for column in needed.iter().copied() {
+            let col = self.parse_column(column)?;
             let mut index = ColumnIndex::default();
             for (row_key, row) in &self.rows {
-                let value = row.column(column).ok_or_else(|| {
+                let value = row.column(col).ok_or_else(|| {
                     anyhow::anyhow!(
                         "表 {} 未在 DataTable::column 暴露声明所需列 {column}",
                         self.spec.id
@@ -434,7 +429,13 @@ fn verify_primary_keys<T: DataTable>(table: &Table<T>) -> anyhow::Result<()> {
     for (json_key, row) in &table.rows {
         let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(table.spec.pk.len());
         for column in table.spec.pk {
-            let value = row.column(column).ok_or_else(|| {
+            let col = T::Column::parse(column).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "表 {} 的列 {column} 未在其 Column 枚举定义（Spec 与枚举不同步）",
+                    table.spec.id
+                )
+            })?;
+            let value = row.column(col).ok_or_else(|| {
                 anyhow::anyhow!("表 {} 缺少主键列 {column}", table.spec.id)
             })?;
             parts.push(value);
@@ -781,6 +782,17 @@ mod tests {
         assert_eq!(ColVal::Text("09018").to_string(), "09018");
     }
 
+    /// `as_str` ↔ `parse` 必须一一对应，未知列名返回 `None`——这是「Spec 与枚举不同步」
+    /// 会在加载期被 `parse_column` 当场拦截的底层保证。
+    #[test]
+    fn column_name_round_trips_and_rejects_unknown() {
+        use crate::domain::AssetColumn;
+        for col in AssetColumn::ALL {
+            assert_eq!(AssetColumn::parse(col.as_str()), Some(*col), "往返不一致: {col:?}");
+        }
+        assert_eq!(AssetColumn::parse("no_such_column"), None);
+    }
+
     #[derive(Debug, serde::Deserialize)]
     #[allow(dead_code)]
     struct IntDict {
@@ -788,15 +800,34 @@ mod tests {
         label: String,
     }
 
-    impl DataTable for IntDict {
-        const ID: &'static str = "int_dict";
-        fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
-            match name {
-                "id" => Some(ColVal::Int(self.id)),
-                _ => None,
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IntDictColumn {
+        Id,
+        Label,
+    }
+
+    impl ColumnName for IntDictColumn {
+        const ALL: &'static [Self] = &[Self::Id, Self::Label];
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Id => "id",
+                Self::Label => "label",
             }
         }
     }
+
+    impl DataTable for IntDict {
+        const ID: &'static str = "int_dict";
+        type Column = IntDictColumn;
+        fn column(&self, col: IntDictColumn) -> Option<ColVal<'_>> {
+            match col {
+                IntDictColumn::Id => Some(ColVal::Int(self.id)),
+                IntDictColumn::Label => None,
+            }
+        }
+    }
+
+    impl RowValidator for IntDict {}
 
     /// 契约修订核心：`i64` 主键能走 `column → ColVal::Int → 行键/索引` 全链路，
     /// 且读侧不经 `&str` —— 证明「主键只能文本」的天花板已解除。
@@ -822,5 +853,36 @@ mod tests {
         assert!(table.contains_key("1001"), "整型主键应拼成十进制行键");
         assert!(table.has("id", "1002"), "列索引应命中整型取值");
         assert!(!table.has("id", "9999"), "不存在的整型取值应判否");
+    }
+
+    /// 0.7.6 防漂移：锁定 codegen 产物内部的契约 —— `tables.toml` 声明的每列（主键 + 本表外键源列）
+    /// 必须能在生成的 `XxxColumn` 里 `parse` 出来，且列枚举 `as_str` 全局唯一。
+    /// specs 与 enum 同源于一次 codegen，本测试把这条不变量固化，防止任一侧被手改漂移。
+    #[test]
+    fn generated_column_enums_cover_declared_columns() {
+        fn assert_covered<T: DataTable>(spec_id: &str) {
+            let spec = spec_of(spec_id).expect("表未在 TABLES 声明");
+            let mut cols: Vec<&str> = spec.pk.to_vec();
+            cols.extend(spec.fk.iter().map(|(src, _, _)| *src));
+            for col in cols {
+                assert!(
+                    T::Column::parse(col).is_some(),
+                    "表 {spec_id} 声明列 {col} 不在其 Column 枚举（specs↔enum 漂移）"
+                );
+            }
+            let mut seen = HashSet::new();
+            for variant in T::Column::ALL {
+                assert!(
+                    seen.insert(variant.as_str()),
+                    "表 {spec_id} 列枚举 as_str 重复: {}",
+                    variant.as_str()
+                );
+            }
+        }
+        assert_covered::<User>("user_info");
+        assert_covered::<Account>("account_info");
+        assert_covered::<Security>("dict_security");
+        assert_covered::<Asset>("account_asset");
+        assert_covered::<Position>("position");
     }
 }

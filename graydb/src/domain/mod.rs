@@ -1,37 +1,71 @@
+//! 领域层：codegen 产物的重导出 + 业务枚举 + 人写的单行不变量。
+//!
+//! 分工（阶段 0.7）：
+//! - `struct` 字段、`XxxColumn` 列枚举、`impl DataTable` 由 `codegen` 从
+//!   `sql/schema.sql` + `tables.toml` 生成（见 `crate::generated`），本模块 `pub use` 转出，
+//!   保持 `crate::domain::Security` 等旧路径不变；
+//! - 业务枚举（`Side` / `IdType` / …）表达语义、不由 DDL 物理类型推出，留此手写；
+//! - 单行不变量写在 `impl RowValidator` 里 —— `check_row` 默认转调它，与生成的
+//!   `impl DataTable` 各占一块，重跑 codegen 不覆盖业务逻辑。
+
 use account::amount::{Money, Price, Quantity};
-use crate::tables::{ColVal, DataTable};
+use crate::tables::RowValidator;
 use serde::{Deserialize, Serialize};
 
-/// 证券字典 —— 未来表: dict_security
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Security {
-    pub symbol: String, // 主键, "09018"
-    pub name: String,
-    pub currency: String,
-    pub lot_size: Quantity,
-    pub price_tick: Price,
-    pub market: String,
+// codegen 生成的表类型与列枚举：从 `crate::generated` 转出，对外路径仍是 `crate::domain::*`。
+pub use crate::generated::{
+    Account, AccountColumn, Asset, AssetColumn, Position, PositionColumn, Security, SecurityColumn,
+    User, UserColumn,
+};
+
+// ---------------------------------------------------------------------------
+// 业务枚举（非表结构，DDL 推不出语义，故手写；`numeric`→Amount 的映射在 tables.toml）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdType {
+    IdCard,
+    Passport,
+    BusinessLicense,
 }
 
-/// 资金账户 —— 未来表: account_asset (日终余额 = 初始 + 成交累计)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Asset {
-    pub account_id: String,
-    pub currency: String,
-    pub available: Money, // 可用
-    pub frozen: Money,    // 冻结
-    pub total_market_value: Money,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserStatus {
+    Active,
+    Frozen,
+    Closed,
 }
 
-/// 持仓 —— 未来表: position (日终快照)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Position {
-    pub account_id: String,
-    pub symbol: String,
-    pub quantity: Quantity,
-    pub available_qty: Quantity,
-    pub avg_cost: Price, // 摊薄成本
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStatus {
+    Active,
+    Frozen,
+    Closed,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    New,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
+}
+
+// ---------------------------------------------------------------------------
+// 尚未登记进注册中心的类型：`Order` / `Trade`（阶段 1.1 建 engine 时补 DDL + codegen）
+// ---------------------------------------------------------------------------
 
 /// 委托单 —— 未来表: orders
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,105 +96,21 @@ pub struct Trade {
     pub seq: u64,
 }
 
-/// 用户主数据 —— 未来表: user_info
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct User {
-    pub user_id: String, // 主键
-    pub username: String,
-    pub phone: String,
-    pub id_type: IdType,
-    pub id_number: String,
-    pub status: UserStatus,
-    pub opened_at: String, // ISO8601
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IdType {
-    IdCard,
-    Passport,
-    BusinessLicense,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UserStatus {
-    Active,
-    Frozen,
-    Closed,
-}
-
-/// 账户主数据 —— 未来表: account_info
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Account {
-    pub account_id: String, // 主键
-    pub user_id: String,
-    pub account_name: String,
-    pub status: AccountStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountStatus {
-    Active,
-    Frozen,
-    Closed,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OrderStatus {
-    New,
-    PartiallyFilled,
-    Filled,
-    Cancelled,
-    Rejected,
-}
-
 // ---------------------------------------------------------------------------
-// 表声明绑定（阶段 0.5）
-//
-// 每个 `impl DataTable` 只回答两件事：我是哪张表、我这一行自己合法吗（不跨表）。
-// 列取值经 `column` 暴露（文本列 `ColVal::Text` 零拷贝），只需覆盖 `Spec::pk`
-// 与被外键引用的列，其余列一律 `None` —— 它在冷路径，不进撮合。
-// 主键拼法由 `Spec::pk` 单方定义，不再在类型侧手写 `pk_parts`。
+// 单行不变量（人写，跨列/业务约束）：`DataTable::check_row` 默认转调 `validate_row`。
+// 跨表不变量由 `Spec::fk` 声明 + `FkIndex` 承担；聚合不变量（市值守恒）留在 `mem.rs`。
 // ---------------------------------------------------------------------------
 
-impl DataTable for User {
-    const ID: &'static str = "user_info";
-
-    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
-        match name {
-            "user_id" => Some(ColVal::Text(&self.user_id)),
-            _ => None,
-        }
-    }
-
-    fn check_row(&self) -> anyhow::Result<()> {
+impl RowValidator for User {
+    fn validate_row(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.user_id.is_empty(), "user_id 不能为空");
         anyhow::ensure!(!self.username.trim().is_empty(), "用户 {} 缺少姓名", self.user_id);
         Ok(())
     }
 }
 
-impl DataTable for Account {
-    const ID: &'static str = "account_info";
-
-    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
-        match name {
-            "account_id" => Some(ColVal::Text(&self.account_id)),
-            "user_id" => Some(ColVal::Text(&self.user_id)),
-            _ => None,
-        }
-    }
-
-    fn check_row(&self) -> anyhow::Result<()> {
+impl RowValidator for Account {
+    fn validate_row(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.account_id.is_empty(), "account_id 不能为空");
         anyhow::ensure!(
             !self.user_id.is_empty(),
@@ -171,17 +121,8 @@ impl DataTable for Account {
     }
 }
 
-impl DataTable for Security {
-    const ID: &'static str = "dict_security";
-
-    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
-        match name {
-            "symbol" => Some(ColVal::Text(&self.symbol)),
-            _ => None,
-        }
-    }
-
-    fn check_row(&self) -> anyhow::Result<()> {
+impl RowValidator for Security {
+    fn validate_row(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.lot_size.units() > 0,
             "证券 {} 的 lot_size 必须为正（手数 0 会造成下单不整手）",
@@ -196,19 +137,10 @@ impl DataTable for Security {
     }
 }
 
-impl DataTable for Asset {
-    const ID: &'static str = "account_asset";
-
-    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
-        match name {
-            "account_id" => Some(ColVal::Text(&self.account_id)),
-            _ => None,
-        }
-    }
-
+impl RowValidator for Asset {
     /// 资金非负是原 `check_integrity` 的手写循环，现在是单行不变量。
     /// `available + frozen` 守恒由 `mem::try_freeze` 等原语保证，不在此重复。
-    fn check_row(&self) -> anyhow::Result<()> {
+    fn validate_row(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.available.is_negative() && !self.frozen.is_negative(),
             "账户 {} 资金为负",
@@ -223,18 +155,8 @@ impl DataTable for Asset {
     }
 }
 
-impl DataTable for Position {
-    const ID: &'static str = "position";
-
-    fn column(&self, name: &'static str) -> Option<ColVal<'_>> {
-        match name {
-            "account_id" => Some(ColVal::Text(&self.account_id)),
-            "symbol" => Some(ColVal::Text(&self.symbol)),
-            _ => None,
-        }
-    }
-
-    fn check_row(&self) -> anyhow::Result<()> {
+impl RowValidator for Position {
+    fn validate_row(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.quantity >= self.available_qty,
             "持仓 {} 可卖数量大于总数量",

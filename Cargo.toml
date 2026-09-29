@@ -1,5 +1,5 @@
 [workspace]
-members = ["account", "graydb"]
+members = ["account", "graydb", "codegen"]
 
 [package]
 name = "GrayMarket"

@@ -1,6 +1,6 @@
 # GrayDB 推进计划
 
-> 最后更新：2026-09-29　|　分支：master　|　状态：**阶段 0 + 0.5 完成，待阶段 1（内核写路径）**
+> 最后更新：2026-09-29　|　分支：master　|　状态：**阶段 0 + 0.5 + 0.6 + 0.7（DDL 驱动 codegen）完成，下一步：阶段 1（内核写路径）**
 
 ## 一、项目定位
 
@@ -27,22 +27,29 @@ GrayDB 是**交易内核 + 主数据镜像 + 归档网关**，分层如下：
 
 ```text
 GrayMarket/
-├── Cargo.toml              members = ["account", "graydb"]；根 package GrayMarket
+├── Cargo.toml              members = ["account", "graydb", "codegen"]；根 package GrayMarket
+├── .cargo/config.toml      alias: codegen = "run -p codegen"
 ├── src/main.rs             冒烟入口（notional 演示）
 ├── account/                定点数领域库（可跨项目复用）
 │   └── src/
 │       ├── amount.rs       ~1120 行：Amount<SCALE,B> + 序列化 + 32 个测试
 │       ├── mem_tb_row_pd_unit_capit_trade.rs
 │       └── product_info.rs
+├── codegen/                DDL 驱动代码生成器（独立工具 crate，不被运行期依赖）
+│   ├── Cargo.toml          deps: serde, toml, anyhow
+│   └── src/main.rs         解析 schema.sql + tables.toml → 写 graydb/src/generated/
 └── graydb/                 应用 crate（当前 mock 阶段）
     ├── Cargo.toml          deps: account, rust_decimal, serde, serde_json, anyhow
+    ├── sql/schema.sql      表结构事实源（列名/顺序/物理类型；生产由 pg_dump 维护）
+    ├── tables.toml         策略与类型映射（file/kind/policy/pk/fk/expected_rows + numeric→Amount、text→枚举）
     ├── data/               mock 数据（手写 JSON = 未来 PG 表的投影）
     │   ├── dict/           security.json(2), user.json(3)
     │   └── state/          account.json(3), asset.json(3), position.json(2)
     └── src/
         ├── main.rs         启动入口（加载 + 启动报告）+ mock_data_tests(2)
-        ├── tables.rs       表清单与注册中心：Spec / TABLES / DataTable / load_table / FkIndex / TableStat + tests(6)
-        ├── domain/mod.rs   领域结构 + snake_case 枚举 + 5 个 impl DataTable
+        ├── generated/      ← codegen 产物（签入库，勿手改）：5 表 struct/列枚举/impl DataTable + specs(TABLES) + mod
+        ├── tables.rs       注册中心：Spec / DataTable(+type Column,:RowValidator) / ColVal / ColumnName / RowValidator / load_table / FkIndex / TableStat + tests(10)
+        ├── domain/mod.rs   业务枚举 + Order/Trade + 5 个 impl RowValidator（人写不变量）+ pub use generated
         ├── mem.rs          Snapshot（强类型 `Table<T>` 字段）+ 声明式校验 + 资金三原语 + tests(4)
         └── journal.rs      JSONL 流水（std::io::Result）
 ```
@@ -60,12 +67,16 @@ GrayMarket/
 | 未知即拒绝 | 浮点混入、未知字段、越界值全部 `Err`，不退化为默认值 | 测试锁定 |
 | Decimal 依赖 | `serde-with-str`（弃用 `serde-float`，防浮点往返） | 三个 Cargo.toml |
 | 错误处理分层 | 冷路径 `anyhow`；journal `std::io::Result`；热路径将来 `RejectReason` | 约定 |
-| 复合主键 | `composite_key(parts) = "a:b"` 单一构造函数；`position_key` 已并入 | `tables.rs` |
+| 复合主键 | `composite_key(&[ColVal]) = "a:b"` 单一构造函数（另有 `composite_key_str(&[&str])` 便捷入口）；`position_key` 已并入 | `tables.rs` |
+| 列取值零拷贝 | `ColVal::{Text(&str), Int(i64)}`（`Copy`）：文本借用零拷贝、整型/`Amount.units()` 内联，整型主键得进注册中心而读侧不分配；否决 `Cow<str>`（百万级 TPS 频繁转换不可接受） | `tables.rs` |
+| 列访问编译期检查 | `DataTable::Column` 关联枚举取代字符串列名；`column` 匹配变体（拼错不过编），`ColumnName::as_str` 是列名字面量唯一来源，`parse` 由 `ALL` 反查 | `tables.rs` + `domain/mod.rs` |
+| 行键单一来源 | 删除手写 `pk_parts()`，行键 = `Spec::pk` 逐列 `column()` → `composite_key`，`verify_primary_keys` 机械核对「声明拼键 == JSON 外层键」 | `tables.rs` |
 | 表身份 | `Spec::id` 同时是内存表 / WAL `table` 字段 / 订阅 topic / PG 表名的唯一身份 | `tables.rs::TABLES` |
-| 声明↔类型锚定 | `DataTable::ID` ↔ `Spec::id` 加载期双向核对，漏任一侧编译或启动即失败 | `tables.rs` + `domain/mod.rs` |
+| 声明↔类型锚定 | `DataTable::ID` ↔ `Spec::id` 加载期双向核对；`Table::parse_column` 把 Spec 列名翻译成枚举，「声明了枚举没有的列」加载即报错（新捕获点） | `tables.rs` + `domain/mod.rs` |
 | 外键声明式 | `fk = (本表列, 目标表 id, 目标表列)`；校验只遍历声明，允许成环（载入后统一校） | `FkIndex::check` |
 | 列索引只一份 | `ColumnIndex{values, rows}`：成员判定 + 报错能指认到行；不做 `dyn` 行容器 | `tables.rs` |
 | 分级启动 | `Critical` 拒启 / `Optional` 告警降级空表并跳过其外键边 / `Lazy` 不读文件 | `read_rows` |
+| DDL 驱动 codegen | 独立 `codegen` crate 从 `sql/schema.sql` + `tables.toml` 生成 struct/列枚举/`impl DataTable`/`Spec`；`impl DataTable` 不含校验，`check_row` 默认转调人写的 `RowValidator`，重跑不覆盖业务 | `codegen/` + `graydb/src/generated/` |
 
 ### Mock 数据的自洽不变量（已有测试守护）
 
@@ -78,10 +89,10 @@ total_market_value = Σ(quantity × avg_cost)         ← `Snapshot::load` 即�
   asset.account_id    → account_info.account_id
   position.account_id → account_info.account_id
   position.symbol     → dict_security.symbol
-quantity ≥ available_qty                            ← `Position::check_row`
-资金/市值 非负                                        ← `Asset::check_row`
-lot_size > 0 && price_tick > 0                       ← `Security::check_row`
-JSON 外层键 == composite_key(Spec::pk) == pk_parts() ← `load_table` 机械校验
+quantity ≥ available_qty                            ← `impl RowValidator for Position`
+资金/市值 非负                                        ← `impl RowValidator for Asset`
+lot_size > 0 && price_tick > 0                       ← `impl RowValidator for Security`
+JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机械校验（`pk_parts` 已删）
 每张表行数 == `Spec::expected_rows`                   ← mock 阶段数据回归哨兵（接 PG 后置 None）
 ```
 
@@ -89,7 +100,7 @@ JSON 外层键 == composite_key(Spec::pk) == pk_parts() ← `load_table` 机械�
 
 | 位置 | 测试 |
 |---|---|
-| `graydb/src/tables.rs` | 6 个守护测试：`table_ids_are_unique_and_match_files`、`every_declared_table_is_loaded_and_nonempty_or_marked`、`critical_table_missing_refuses_startup`、`optional_table_degrades_to_empty_and_is_marked`、`fk_violation_is_caught_from_declaration_only`、`primary_key_must_match_json_outer_key` |
+| `graydb/src/tables.rs` | 10 个守护测试：`table_ids_are_unique_and_match_files`、`every_declared_table_is_loaded_and_nonempty_or_marked`、`critical_table_missing_refuses_startup`、`optional_table_degrades_to_empty_and_is_marked`、`fk_violation_is_caught_from_declaration_only`、`primary_key_must_match_json_outer_key`、`composite_key_mixed_segments_render_stably`、`column_name_round_trips_and_rejects_unknown`、`int_primary_key_is_supported_end_to_end`、`generated_column_enums_cover_declared_columns` |
 | `graydb/src/mem.rs` | `loads_all_mock_json_into_memory`、`tradability_respects_account_and_dict`、`freeze_conserves_available_plus_frozen`、`composite_key_is_stable_and_matches_json_layout` |
 | `graydb/src/main.rs` | `all_mock_json_files_match_domain_structs`（改用 `Snapshot::load`）、`asset_invariants_hold`（测试自行复算市值，不复用生产实现） |
 | `account/src/amount.rs` | 32 个：标度显示 / 边界 / widen-narrow / 5 种舍入 / Decimal 互转 / notional / 三段式落账 / settle 错误 / 序列化格式 / 越界拒绝 / 枚举 snake_case |
@@ -124,7 +135,7 @@ JSON 外层键 == composite_key(Spec::pk) == pk_parts() ← `load_table` 机械�
 | 任务 | 说明 |
 |---|---|
 | 0.5.1 `tables.rs` | `Spec { id, file, kind, policy, pk, fk }` + `TABLES: &[Spec]` 清单；`Kind::{Dict,State}`、`LoadPolicy::{Critical,Optional,Lazy}` |
-| 0.5.2 `DataTable` trait | `const ID` 绑定类型与声明；`pk_parts()` 统一主键拼法（取代 `position_key`）；`check_row()` 承载逐行不变量 |
+| 0.5.2 `DataTable` trait | `const ID` 绑定类型与声明；~~`pk_parts()` 统一主键拼法~~（**0.6 已删**，行键改由 `Spec::pk` × `column` 现算）；`check_row()` 承载逐行不变量 |
 | 0.5.3 通用加载器 | `load_table::<T>()`：读文件 + 「JSON 键 == 主键」机械校验 + `check_row`；漏写 `impl DataTable` 因泛型约束编译失败 |
 | 0.5.4 声明式外键校验 | 遍历 `Spec::fk` 的通用检查器，删除 `check_integrity` 里手写的 `for` 循环 |
 | 0.5.5 `TableStat` | `{ id, rows, policy, lsn }`：LSN 锚点、内存预算、日终对账的公共底座（现在只填 rows） |
@@ -148,6 +159,36 @@ JSON 外层键 == composite_key(Spec::pk) == pk_parts() ← `load_table` 机械�
 - 不把热路径的 `HashMap<String, Asset>` 改成 `dyn Any` 容器 —— 内核访问必须零开销且类型安全；
 - 不做百万行大表的列式/arena 存储 —— 等阶段 4 有真实体量数据再决策（`Kind`/`LoadPolicy` 已预留）。
 
+### ✅ 阶段 0.6：列访问契约修订（ColVal + 每表列枚举，已完成）
+
+背景：面向百表规模，手写 `impl DataTable` 存在「列名 ↔ 字段多处同步、仅运行期校验、整型主键无法表达」三类隐患。分两步独立合入，每步 `test`/`clippy` 全绿。
+
+| 任务 | 说明 |
+|---|---|
+| 0.6.1 `ColVal` | `enum ColVal{ Text(&str), Int(i64) }`（`Copy`）：`column` 读侧零分配，整型/`Amount.units()` 主键可进注册中心；`composite_key` 改收 `&[ColVal]`，新增 `composite_key_str` 便捷入口 |
+| 0.6.2 删 `pk_parts` | 行键唯一由 `Spec::pk` 逐列 `column()` 现算；`verify_primary_keys` 三方比对降为两方（保留「JSON 外层键 == 复合主键」守护）；`FkIndex` 不动 |
+| 0.6.3 `ColumnName` 桥接 | `DataTable::Column` 关联枚举取代字符串列名；`column` 参数升级为每表列枚举（`UserColumn`…），`as_str` 为列名字面量唯一来源，`parse` 默认由 `ALL` 反查 |
+| 0.6.4 `parse_column` 守卫 | `upsert`/`build_columns`/`verify_primary_keys` 在加载边界把 `Spec` 字符串翻译成枚举，未定义即 `Err` |
+
+**验收结果**（2026-09-29）：`cargo test -p graydb` 15 passed（tables 9 + mem 4 + mock 2）；`cargo clippy -p graydb --all-targets` 无警告；新增 `int_primary_key_is_supported_end_to_end`（整型主键全链路）、`composite_key_mixed_segments_render_stably`（Text+Int 混拼）、`column_name_round_trips_and_rejects_unknown`（as_str↔parse 往返 + 未知列名拒）。
+
+**为下一步铺路**：手写的 `XxxColumn` enum + `ColumnName` impl 是纯机械样板，正是 0.7 codegen 要生成的目标；接口已就绪，替换手写不改调用方。
+
+### ✅ 阶段 0.7：DDL 驱动 codegen（已完成）
+
+目标：把「每表 struct 字段 + `XxxColumn` enum + `ColumnName` impl + `impl DataTable` + `Spec` 条目」交给代码生成，列名/类型从 PG DDL 单一事实源产出，人只保留 `check_row` 业务不变量。
+
+| 任务 | 说明 |
+|---|---|
+| 0.7.1 事实源 | `sql/schema.sql`（`pg_dump --schema-only` 维护，DDL 列名 = 唯一来源，含引号大小写如 `"Symbol"`）+ `tables.toml`（策略 `file/kind/policy` 与 `numeric→Money/Price/Quantity` 类型映射，DDL 推不出的语义在此声明） |
+| 0.7.2 codegen 二进制 | 独立 crate `codegen`（非 proc-macro：增量编译友好）；解析受控的 `CREATE TABLE` 子集；**每表产出一个 `src/generated/<type>.rs`**，改一张表只重编一个文件 |
+| 0.7.3 产物 | struct + `#[serde(rename)]` + `XxxColumn` enum + `ColumnName` impl（`as_str` 携带精确列名，字段↔列名同源不可能写错）+ `impl DataTable`（`check_row` 委托给旁路 `RowValidator`）+ `Spec`/`TABLES` 条目 |
+| 0.7.4 业务钩子 | `tables.rs` 加 `trait RowValidator{ fn validate_row(&self)->Result<()>{Ok(())} }`，人把 `check_row` 逻辑迁到 `impl RowValidator for Xxx`；样板归宏、不变量归人 |
+| 0.7.5 防漂移 | `.cargo/config.toml` 别名 `cargo codegen`；CI 跑 codegen 后 `git diff --exit-code generated/`，DDL 改了忘重跑即挂 |
+| 0.7.6 `Snapshot` 仍手写 | 强类型字段 + 语义方法（`position`/`is_tradable`）不生成；守护测试扩一条「`generated` 每张表都在 `Snapshot` 有 register」 |
+
+**验收结果**（2026-09-29）：新增独立 `codegen` crate + `sql/schema.sql` + `tables.toml` + `.cargo/config.toml` 别名；`cargo codegen` 一次产出 5 表到 `graydb/src/generated/`（struct/列枚举/`ColumnName`/`impl DataTable`）+ `specs.rs`（`TABLES`）+ `mod.rs`；`domain/mod.rs` 改为 `pub use` 生成物 + 保留业务枚举与 `impl RowValidator`；`tables.rs` 手写 `TABLES` 换为 `pub use crate::generated::TABLES`。`cargo test -p graydb` 16 passed（tables 10 + mem 4 + mock 2）——**关键证明：换成生成样板后，加载/主键/外键/市值全部测试零修改通过**；`cargo clippy --workspace --all-targets` 零警告；`cargo run -p graydb` 输出不变。numeric/浮点列无显式映射时 codegen 直接报错（不猜、不静默落浮点）。
+
 ### 阶段 1：内核写路径（**下一步**）
 
 目标：跑通「下单 → 校验 → 冻结资金 → 模拟成交 → 记账 → 写日志」全链路。
@@ -159,7 +200,7 @@ JSON 外层键 == composite_key(Spec::pk) == pk_parts() ← `load_table` 机械�
 | 1.3 seq 单调 + 空洞检测 | 每笔写占一个 `seq`；跳号即 `panic!`（fail-fast，宁停不脏） |
 | 1.4 幂等键 | `order_id` 重复提交 → 返回原单，不重复冻结 |
 | 1.5 写路径顺序 | 校验 → **先写 journal** → 改内存 → 回 ACK（将来升级为「+ fsync + 从库确认」） |
-| 1.6 持仓更新 | 买入 `quantity += q`、`available_qty` 按 T+1 置 0；`avg_cost` 用 `notional` / `convert` 精确计算；新增行走 `Table::upsert`（主键由 `pk_parts` 现算，列索引同步维护） |
+| 1.6 持仓更新 | 买入 `quantity += q`、`available_qty` 按 T+1 置 0；`avg_cost` 用 `notional` / `convert` 精确计算；新增行走 `Table::upsert`（主键由 `Spec::pk` × `column` 现算，列索引同步维护） |
 | 1.7 事务边界 | 一笔成交引发的多表变更（asset + position + order + trade）打包为同 `seq` 的一组记录 |
 | 1.8 清理 | 遗留问题 6、7、8、9 一并解决（1–5、10 已在阶段 0.5 清完） |
 
@@ -215,10 +256,11 @@ JSON 外层键 == composite_key(Spec::pk) == pk_parts() ← `load_table` 机械�
 ```powershell
 cargo test                      # 全 workspace
 cargo test -p account           # 定点数与序列化测试
-cargo test -p graydb            # 守护 6 + mem 4 + mock 2 = 12 个测试
+cargo test -p graydb            # 守护 10 + mem 4 + mock 2 = 16 个测试
 cargo test -p graydb tables::    # 只跑表清单/注册中心守护测试
 cargo test -p graydb mem::     # 只跑内存镜像测试
 cargo clippy --workspace --all-targets
+cargo codegen                   # 改 DDL/tables.toml 后重生成 graydb/src/generated（= run -p codegen）
 cargo run -p graydb             # 加载 + 按 TABLES 打印启动报告
 cargo run                       # 根 package GrayMarket
 ```
@@ -250,6 +292,7 @@ RustRover：Cargo 面板 → `graydb > tests` 可批量运行；`Cargo.toml` 变
 | 表数量增长导致加载/校验/保存三处不同步 | 静默少加载一张表，业务在缺数据的情况下继续跑 | ✅ 已缓解：阶段 0.5 表清单单一事实源 + 守护测试 |
 | 表名在 topic / WAL / COPY 三处各写一遍字符串 | 拼写不一致，订阅收不到、归档进错表 | ✅ 已缓解：`Spec::id` 作为唯一身份贯穿三处 |
 | 所有表同等重要（一张附表坏 = 全停） | 可用性被最弱依赖绑架 | ✅ 已缓解：`LoadPolicy` 分级启动（`Critical`/`Optional`/`Lazy`） |
+| 表名/列名在多处手写样板（column 字面量 + enum + serde）各自写错 | 一致地错，运行期难发现 | ✅ 已缓解：阶段 0.7 codegen 从 DDL 单一源生成，重跑 `cargo codegen` + CI `git diff` 防漂移 |
 | seq 空洞（panic 回滚 / 任务丢包） | 日志与内存分叉，无法收敛 | 阶段 1.3 fail-fast |
 | 订阅端拖慢内核主循环 | 全市场延迟劣化 | 阶段 3.4 慢消费者隔离 |
 | `Rounding` 反序列化退化为默认值 | 静默改变金额 | 已禁 `#[serde(other)]`，未知即 `Err` |

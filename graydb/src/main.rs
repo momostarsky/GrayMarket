@@ -1,5 +1,6 @@
 pub mod journal;
 pub mod domain;
+pub mod generated;
 pub mod mem;
 pub mod tables;
 
@@ -9,7 +10,7 @@ use account::amount::{Money, Price, Quantity, Rounding, notional};
 
 use crate::domain::Security;
 use crate::mem::Snapshot;
-use crate::tables::{DataTable, composite_key_str};
+use crate::tables::{ColumnName, DataTable, composite_key_str};
 
 fn main() {
     println!("Hello, GrayDB!");
@@ -129,12 +130,16 @@ fn dump_pk_columns<T: DataTable>(table: &tables::Table<T>) {
     keys.sort_unstable();
     for key in keys {
         let row = table.rows().get(key).expect("刚列出来的键必然在表里");
-        // `DataTable::column` 是字符串取列的唯一入口，只开放声明用得到的列。
+        // 声明里的列名先 `parse` 成本表列枚举，再经 `DataTable::column` 取值（只开放声明用得到的列）。
         let rendered: Vec<String> = table
             .spec
             .pk
             .iter()
-            .filter_map(|column| row.column(column).map(|value| format!("{column}={value}")))
+            .filter_map(|column| {
+                T::Column::parse(column)
+                    .and_then(|col| row.column(col))
+                    .map(|value| format!("{column}={value}"))
+            })
             .collect();
         println!("  {:<14} {key:<16} {}", table.spec.id, rendered.join(" "));
     }
