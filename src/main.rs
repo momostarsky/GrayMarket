@@ -7,10 +7,10 @@ fn main() {
     let buy_price = Price::from_decimal(rust_decimal::dec!(9.0025));
     let amtstock = Money::from_decimal(rust_decimal::dec!(10000)); // 100.05 元
     println!("Stock: {}", amtstock.unwrap().units());
-    println!("Stock: {}", amtstock.unwrap().to_string());
+    println!("Stock: {}", amtstock.unwrap());
     println!("Stock: {}", amtstock.unwrap().to_decimal().unwrap());
     println!("symbol_code Of Stock: {}", symbol_code);
-    println!("Num Of Stock: {}", nums.unwrap().to_string());
+    println!("Num Of Stock: {}", nums.unwrap());
     if let Some(price) = buy_price {
         println!("Buy Price: {}", price.to_decimal().unwrap());
     }

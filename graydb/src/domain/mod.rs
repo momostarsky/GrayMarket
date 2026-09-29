@@ -1,4 +1,5 @@
 use account::amount::{Money, Price, Quantity};
+use crate::tables::DataTable;
 use serde::{Deserialize, Serialize};
 
 /// 证券字典 —— 未来表: dict_security
@@ -120,4 +121,146 @@ pub enum OrderStatus {
     Filled,
     Cancelled,
     Rejected,
-} 
+}
+
+// ---------------------------------------------------------------------------
+// 表声明绑定（阶段 0.5）
+//
+// 每个 `impl DataTable` 只回答三件事：我是哪张表、我的主键在哪几列、
+// 我这一行自己合法吗（不跨表）。`column` 只需覆盖 `Spec::pk` 与被外键引用的列，
+// 其余列一律 `None` —— 它在冷路径，不进撮合。
+// ---------------------------------------------------------------------------
+
+impl DataTable for User {
+    const ID: &'static str = "user_info";
+
+    fn column(&self, name: &'static str) -> Option<&str> {
+        match name {
+            "user_id" => Some(&self.user_id),
+            _ => None,
+        }
+    }
+
+    fn pk_parts(&self) -> Vec<&str> {
+        vec![&self.user_id]
+    }
+
+    fn check_row(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.user_id.is_empty(), "user_id 不能为空");
+        anyhow::ensure!(!self.username.trim().is_empty(), "用户 {} 缺少姓名", self.user_id);
+        Ok(())
+    }
+}
+
+impl DataTable for Account {
+    const ID: &'static str = "account_info";
+
+    fn column(&self, name: &'static str) -> Option<&str> {
+        match name {
+            "account_id" => Some(&self.account_id),
+            "user_id" => Some(&self.user_id),
+            _ => None,
+        }
+    }
+
+    fn pk_parts(&self) -> Vec<&str> {
+        vec![&self.account_id]
+    }
+
+    fn check_row(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.account_id.is_empty(), "account_id 不能为空");
+        anyhow::ensure!(
+            !self.user_id.is_empty(),
+            "账户 {} 未归属任何用户",
+            self.account_id
+        );
+        Ok(())
+    }
+}
+
+impl DataTable for Security {
+    const ID: &'static str = "dict_security";
+
+    fn column(&self, name: &'static str) -> Option<&str> {
+        match name {
+            "symbol" => Some(&self.symbol),
+            _ => None,
+        }
+    }
+
+    fn pk_parts(&self) -> Vec<&str> {
+        vec![&self.symbol]
+    }
+
+    fn check_row(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.lot_size.units() > 0,
+            "证券 {} 的 lot_size 必须为正（手数 0 会造成下单不整手）",
+            self.symbol
+        );
+        anyhow::ensure!(
+            self.price_tick.units() > 0,
+            "证券 {} 的 price_tick 必须为正",
+            self.symbol
+        );
+        Ok(())
+    }
+}
+
+impl DataTable for Asset {
+    const ID: &'static str = "account_asset";
+
+    fn column(&self, name: &'static str) -> Option<&str> {
+        match name {
+            "account_id" => Some(&self.account_id),
+            _ => None,
+        }
+    }
+
+    fn pk_parts(&self) -> Vec<&str> {
+        vec![&self.account_id]
+    }
+
+    /// 资金非负是原 `check_integrity` 的手写循环，现在是单行不变量。
+    /// `available + frozen` 守恒由 `mem::try_freeze` 等原语保证，不在此重复。
+    fn check_row(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.available.is_negative() && !self.frozen.is_negative(),
+            "账户 {} 资金为负",
+            self.account_id
+        );
+        anyhow::ensure!(
+            !self.total_market_value.is_negative(),
+            "账户 {} 市值为负",
+            self.account_id
+        );
+        Ok(())
+    }
+}
+
+impl DataTable for Position {
+    const ID: &'static str = "position";
+
+    fn column(&self, name: &'static str) -> Option<&str> {
+        match name {
+            "account_id" => Some(&self.account_id),
+            "symbol" => Some(&self.symbol),
+            _ => None,
+        }
+    }
+
+    /// 顺序必须与 `Spec::pk = ["account_id", "symbol"]` 一致，加载时逐列核对。
+    fn pk_parts(&self) -> Vec<&str> {
+        vec![&self.account_id, &self.symbol]
+    }
+
+    fn check_row(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.quantity >= self.available_qty,
+            "持仓 {} 可卖数量大于总数量",
+            self.symbol
+        );
+        anyhow::ensure!(!self.quantity.is_negative(), "持仓 {} 数量为负", self.symbol);
+        Ok(())
+    }
+}
