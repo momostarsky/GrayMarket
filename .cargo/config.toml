@@ -1,0 +1,4 @@
+[alias]
+# DDL 驱动代码生成：改 `graydb/sql/schema.sql` 或 `graydb/tables.toml` 后运行，
+# 重生成 `graydb/src/generated/*.rs`。CI 里可 `cargo codegen && git diff --exit-code` 防漂移。
+codegen = "run -p codegen"

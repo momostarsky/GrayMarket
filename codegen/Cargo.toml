@@ -1,0 +1,12 @@
+[package]
+name = "codegen"
+version = "0.1.0"
+edition = "2024"
+description = "从 sql/schema.sql + tables.toml 生成 graydb 的领域样板（struct / 列枚举 / DataTable impl / Spec）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+
+# 纯工具 crate：不被 graydb / 根 package 依赖，与它们互不影响，仅共享同一 workspace 目标目录。

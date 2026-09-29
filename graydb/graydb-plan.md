@@ -1,6 +1,6 @@
 # GrayDB 推进计划
 
-> 最后更新：2026-09-29　|　分支：master　|　状态：**阶段 0 + 0.5 + 0.6 + 0.7（DDL 驱动 codegen）完成，下一步：阶段 1（内核写路径）**
+> 最后更新：2026-09-29　|　分支：master　|　状态：**阶段 0 系列（0 → 0.9.1，三 schema 共 289 张真实表 stub 搬齐）完成，下一步：阶段 1（内核写路径）或 stub 逐表转正**
 
 ## 一、项目定位
 
@@ -37,17 +37,20 @@ GrayMarket/
 │       └── product_info.rs
 ├── codegen/                DDL 驱动代码生成器（独立工具 crate，不被运行期依赖）
 │   ├── Cargo.toml          deps: serde, toml, anyhow
-│   └── src/main.rs         解析 schema.sql + tables.toml → 写 graydb/src/generated/
+│   └── src/main.rs         解析 sql/*.sql + tables.toml → 写 graydb/src/generated/；tests(3) 含真实 dump 守护
 └── graydb/                 应用 crate（当前 mock 阶段）
     ├── Cargo.toml          deps: account, rust_decimal, serde, serde_json, anyhow
-    ├── sql/schema.sql      表结构事实源（列名/顺序/物理类型；生产由 pg_dump 维护）
-    ├── tables.toml         策略与类型映射（file/kind/policy/pk/fk/expected_rows + numeric→Amount、text→枚举）
+    ├── sql/schema.sql      演示表事实源（受控子集；待真实表全部接替后退役）
+    ├── sql/jzdb_prod_schema.sql   真实 pg_dump（jzdb_prod，45 表），重导：`pg_dump -d <库> --schema-only -n jzdb_prod -f ...`
+    ├── sql/jzdb_secu_schema.sql   真实 pg_dump（jzdb_secu，157 表）
+    ├── sql/jzdb_base_schema.sql   真实 pg_dump（jzdb_base，89 表，其中 tb_error_log 无主键被 exclude）
+    ├── tables.toml         策略与类型映射（[[table]] 显式声明 + [[stub]] 整表搬入；source/table 指定 DDL 来源，register 控制是否进 TABLES）
     ├── data/               mock 数据（手写 JSON = 未来 PG 表的投影）
     │   ├── dict/           security.json(2), user.json(3)
     │   └── state/          account.json(3), asset.json(3), position.json(2)
     └── src/
         ├── main.rs         启动入口（加载 + 启动报告）+ mock_data_tests(2)
-        ├── generated/      ← codegen 产物（签入库，勿手改）：5 表 struct/列枚举/impl DataTable + specs(TABLES) + mod
+        ├── generated/      ← codegen 产物（签入库，勿手改）：297 文件 = 5 登记表演示 + 1 试点 + 289 stub 真实表 + specs(TABLES) + mod
         ├── tables.rs       注册中心：Spec / DataTable(+type Column,:RowValidator) / ColVal / ColumnName / RowValidator / load_table / FkIndex / TableStat + tests(10)
         ├── domain/mod.rs   业务枚举 + Order/Trade + 5 个 impl RowValidator（人写不变量）+ pub use generated
         ├── mem.rs          Snapshot（强类型 `Table<T>` 字段）+ 声明式校验 + 资金三原语 + tests(4)
@@ -77,6 +80,9 @@ GrayMarket/
 | 列索引只一份 | `ColumnIndex{values, rows}`：成员判定 + 报错能指认到行；不做 `dyn` 行容器 | `tables.rs` |
 | 分级启动 | `Critical` 拒启 / `Optional` 告警降级空表并跳过其外键边 / `Lazy` 不读文件 | `read_rows` |
 | DDL 驱动 codegen | 独立 `codegen` crate 从 `sql/schema.sql` + `tables.toml` 生成 struct/列枚举/`impl DataTable`/`Spec`；`impl DataTable` 不含校验，`check_row` 默认转调人写的 `RowValidator`，重跑不覆盖业务 | `codegen/` + `graydb/src/generated/` |
+| 真实 pg_dump 多源接入 | 每表 `source`（sql 文件）+ `table`（DDL 名，可后缀匹配 schema 限定）；解析器吃多词类型/内联约束/IDENTITY/非建表语句；numeric 映射优先级 `types` 逐列 > `numeric_default` 整表，都缺即报错 | 阶段 0.8 |
+| `register=false` 迁移态 | 只生成 struct（含空 `RowValidator`，文件机器独占）不进 `TABLES`/不加载/不校验 —— 绕开「登记即须 Snapshot 字段+数据文件」的全套接入成本，真实表可一张一张搬 | 阶段 0.8 |
+| stub 整表搬入 | `[[stub]] source` 把整份 dump 一键展开成占位 struct：全名 Pascal 防跨模块撞名、pk 统一 `row_id`（缺列精确报错、无主键表 `exclude`）、numeric→`Decimal` 无损占位；转正 = 写同表 `[[table]]` 自动让位 | 阶段 0.9 |
 
 ### Mock 数据的自洽不变量（已有测试守护）
 
@@ -104,6 +110,7 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 | `graydb/src/mem.rs` | `loads_all_mock_json_into_memory`、`tradability_respects_account_and_dict`、`freeze_conserves_available_plus_frozen`、`composite_key_is_stable_and_matches_json_layout` |
 | `graydb/src/main.rs` | `all_mock_json_files_match_domain_structs`（改用 `Snapshot::load`）、`asset_invariants_hold`（测试自行复算市值，不复用生产实现） |
 | `account/src/amount.rs` | 32 个：标度显示 / 边界 / widen-narrow / 5 种舍入 / Decimal 互转 / notional / 三段式落账 / settle 错误 / 序列化格式 / 越界拒绝 / 枚举 snake_case |
+| `codegen/src/main.rs` | 4 个：`parses_real_pg_dump`（jzdb_prod 45 表全解析 + 多词类型/引号列名/内联约束）、`parses_demo_schema`、`stub_expansion_rules_hold`（全名 Pascal 不撞车 + 无 row_id 报错）、`snake_case_handles_acronyms` |
 
 ## 三、遗留问题（进入阶段 1 前清完）
 
@@ -189,6 +196,42 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 
 **验收结果**（2026-09-29）：新增独立 `codegen` crate + `sql/schema.sql` + `tables.toml` + `.cargo/config.toml` 别名；`cargo codegen` 一次产出 5 表到 `graydb/src/generated/`（struct/列枚举/`ColumnName`/`impl DataTable`）+ `specs.rs`（`TABLES`）+ `mod.rs`；`domain/mod.rs` 改为 `pub use` 生成物 + 保留业务枚举与 `impl RowValidator`；`tables.rs` 手写 `TABLES` 换为 `pub use crate::generated::TABLES`。`cargo test -p graydb` 16 passed（tables 10 + mem 4 + mock 2）——**关键证明：换成生成样板后，加载/主键/外键/市值全部测试零修改通过**；`cargo clippy --workspace --all-targets` 零警告；`cargo run -p graydb` 输出不变。numeric/浮点列无显式映射时 codegen 直接报错（不猜、不静默落浮点）。
 
+**为下一步铺路**：codegen 从此直接吃 `pg_dump --schema-only` 产物（多源），真实表用 `register=false` 渐进接入 —— 见阶段 0.8。
+
+### ✅ 阶段 0.8：codegen 接真实 pg_dump（jzdb_prod 试点，已完成）
+
+背景：真实库 `jzdb_prod`（同库另有 `jzdb_base`/`jzdb_secu`，表最少）已有 45 张表的 `pg_dump` 产物 `sql/jzdb_prod_schema.sql`。目标：生成器直接吃 dump，真实表渐进接入，不动已登记的 5 张演示表。
+
+| 任务 | 说明 |
+|---|---|
+| 0.8.1 多源解析 | 每表 `source`（`sql/` 下文件名，默认 `schema.sql`）+ `table`（DDL 名，默认 = `id`）；同名源只解析一次；后缀匹配允许写 `tb_x` 命中 `jzdb_prod.tb_x`，歧义即报错并列出可用表 |
+| 0.8.2 pg_dump 抗性 | `extract_type` 吃多词类型（`character varying(64)`）与括号精度，遇约束词（NOT/DEFAULT/CONSTRAINT/GENERATED…）截断；表级约束、`ALTER TABLE OWNER/IDENTITY`、`\restrict` 等非建表语句天然跳过 |
+| 0.8.3 缩略语字段名 | `to_snake` 重写：`SEC_charges` → `sec_charges`（旧版会碎成 `s_e_c__charges`），`serde(rename)` 回原列名 |
+| 0.8.4 numeric 批量映射 | `numeric_default` 整表默认（试点表 30 个金额列→`Money`，与 `account::MemTbRowPdUnitCapitTrade` 既有裁决一致）；个别列（如利率）用 `types` 逐列覆盖；两者都缺仍报错 |
+| 0.8.5 `register=false` | 只生成 struct 不登记 `TABLES`（避开守护测试的「登记即须 Snapshot 字段 + 数据文件」全套接入）；文件机器独占故空 `impl RowValidator` 也生成；转正时改 true，人在 `domain` 接手校验 |
+| 0.8.6 守护测试 | codegen 新增 3 测：真实 dump 45 表全解析（含逐列抽查）、演示 schema 回归、缩略语蛇形 |
+
+**验收结果**（2026-09-29）：`cargo test -p codegen` 3 passed（含 45 表/45 列逐项断言）；`cargo codegen` 产 6 表（5 登记 + 试点 `pdunitcapittrade.rs` 不登记，`specs.rs` 验证无 `capit_trade`）；试点 struct 与 DDL 逐列吻合（`bigint→i64`、`integer→i32`、`varchar→String`、30 个 `numeric→Money`、`"SEC_charges"` 带 rename、`row_id` 主键进 `ColVal::Int`）；`cargo test -p graydb` 16 passed 零修改；`cargo clippy --workspace --all-targets` 零警告。
+
+### ✅ 阶段 0.9：stub 整表搬入（prod + secu 共 201 张真实表，已完成）
+
+背景：secu dump 到位（157 表）后共 202 张真实表，逐表手写 `[[table]]` 不可持续。codegen 新增 `[[stub]] source = "..."` 模式：整份 dump 一键展开成占位 struct，机器裁决固定规则，人只在转正时介入。
+
+| 规则 | 内容 |
+|---|---|
+| 命名 | id = 物理表名；struct = 去 `tb_` 的**全表名 Pascal（保留模块段）** —— 侦察发现去模块后 `pdmage/pdswap/pdotcsecu` 的同名 `pd_unit_capit` 撞车，全名规则数学上唯一；stem 重复即报错 |
+| 主键 | 统一 `row_id`（库里每表都有 bigint identity）；缺列即精确报错指向 `[[table]]`/`exclude` 出路 |
+| numeric | → `Decimal` 无损占位：库里 scale 从 2 到 12（利率 8/12 位），统一落 Money(2) = 静默丢精度违反铁律 4；转正时逐列裁决成 Money/Price/Quantity |
+| 边界 | stub 永远 `register=false`（不进 TABLES/不加载/不校验，文件机器独占含空 `impl RowValidator`）；同表写了显式 `[[table]]` 则 stub 自动让位 —— 转正零协调 |
+
+**验收结果**（2026-09-29）：`cargo codegen` 产 207 表（5 登记 + 202 未登记）→ `generated/` 209 文件；`cargo test -p codegen` 4 passed（新增 `stub_expansion_rules_hold`）；`cargo test -p graydb` 16 passed 零修改（200+ 个新 struct 全部参与编译）；`cargo clippy --workspace --all-targets` 零警告；`specs.rs` 仍恰 5 条。
+
+### ✅ 阶段 0.9.1：jzdb_base 接入（三 schema 289 张搬齐，已完成）
+
+`tables.toml` 加第三行 `[[stub]] source = "jzdb_base_schema.sql"` 即完成接入 —— 守卫按设计工作：全库唯一缺 `row_id` 的表是 **`tb_error_log`**（单列 `remark_info` 的日志黑洞表，无合理行键），以 `exclude = ["tb_error_log"]` 排除，将来要接它先由业务定身份列。
+
+**验收结果**（2026-09-29）：base 88 张落盘 → `generated/` 297 文件（5 登记 + 1 试点 + 289 stub + specs + mod + 其余为演示产物）；`cargo test --workspace` 52 passed（account 32 + graydb 16 + codegen 4）零修改；`cargo clippy --workspace --all-targets` 零警告；`specs.rs` 仍恰 5 条；`cargo run -p graydb` 输出不变。真实表三 schema 已全部在册，后续只涉及逐表转正与 Snapshot 接线。
+
 ### 阶段 1：内核写路径（**下一步**）
 
 目标：跑通「下单 → 校验 → 冻结资金 → 模拟成交 → 记账 → 写日志」全链路。
@@ -203,6 +246,8 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 | 1.6 持仓更新 | 买入 `quantity += q`、`available_qty` 按 T+1 置 0；`avg_cost` 用 `notional` / `convert` 精确计算；新增行走 `Table::upsert`（主键由 `Spec::pk` × `column` 现算，列索引同步维护） |
 | 1.7 事务边界 | 一笔成交引发的多表变更（asset + position + order + trade）打包为同 `seq` 的一组记录 |
 | 1.8 清理 | 遗留问题 6、7、8、9 一并解决（1–5、10 已在阶段 0.5 清完） |
+| 1.9 `upsert` 防线①：索引清旧值 | 现状 `ColumnIndex::push` **只增不删**（append-only）：同一行二次 `upsert` 改已索引列后，旧值仍被 `has` 命中（假阳性，外键校验可能放过已不存在的引用），`rows` 里还累积重复项。需补「先按 `row_key` 抹掉旧 `(key, value)` 对并回收不再被任何行持有的 `values`，再插新」；或把「已索引列（pk/fk 目标列）写入后不可变」定成契约并在 `upsert` 拒绝违反——事实验证后二选一 |
+| 1.10 `upsert` 防线②：强制 `check_row` | 现状 `Table::upsert` **未调 `check_row`**，校验完全依赖调用方（engine 的 1.5 顺序）——engine 忘了就是脏写入口。在 `upsert` 入口内强制 `row.check_row()?`（变更前行与变更后行均可校验；双保险成本是一次单行谓词，不在撮合内环），并明确修改路径分工：非索引列原地改走 `rows_mut()`，增删行/改主键/改已索引列一律走 `upsert`（注释已在 `tables.rs`，此处升为契约） |
 
 **验收标准（每条都要有测试）**：
 
@@ -210,7 +255,9 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 - 拒单不产生任何状态变化（原子性）；
 - 重复 `order_id` 不重复扣款；
 - 部分成交（`PartiallyFilled`）下 `filled_qty` 与资金增量一致；
-- 撮合规则保持极简：限价单立即全成（价格/时间优先后续迭代）。
+- 撮合规则保持极简：限价单立即全成（价格/时间优先后续迭代）；
+- （1.9）同一行二次 `upsert` 改已索引列：旧值 `has == false`、索引 `(key, value)` 对数与实际行数一致；
+- （1.10）违反 `check_row` 的行经 `upsert` 写入必 `Err`，且表内容与索引均未被触碰。
 
 ### 阶段 2：日志与恢复
 
@@ -293,6 +340,7 @@ RustRover：Cargo 面板 → `graydb > tests` 可批量运行；`Cargo.toml` 变
 | 表名在 topic / WAL / COPY 三处各写一遍字符串 | 拼写不一致，订阅收不到、归档进错表 | ✅ 已缓解：`Spec::id` 作为唯一身份贯穿三处 |
 | 所有表同等重要（一张附表坏 = 全停） | 可用性被最弱依赖绑架 | ✅ 已缓解：`LoadPolicy` 分级启动（`Critical`/`Optional`/`Lazy`） |
 | 表名/列名在多处手写样板（column 字面量 + enum + serde）各自写错 | 一致地错，运行期难发现 | ✅ 已缓解：阶段 0.7 codegen 从 DDL 单一源生成，重跑 `cargo codegen` + CI `git diff` 防漂移 |
+| `Table::upsert` 索引只增不删、入口不校验 | 写路径一开即脏写入口 + 外键假阳性 | 阶段 1.9–1.10（入口强制 `check_row`、索引清旧值，各配守护测试） |
 | seq 空洞（panic 回滚 / 任务丢包） | 日志与内存分叉，无法收敛 | 阶段 1.3 fail-fast |
 | 订阅端拖慢内核主循环 | 全市场延迟劣化 | 阶段 3.4 慢消费者隔离 |
 | `Rounding` 反序列化退化为默认值 | 静默改变金额 | 已禁 `#[serde(other)]`，未知即 `Err` |

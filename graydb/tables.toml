@@ -1,0 +1,124 @@
+# GrayDB 表策略与类型映射 —— codegen 的第二份输入。
+#
+# 分工：
+#   * sql/*.sql 决定「有哪些列、叫什么、物理类型」：演示表在 schema.sql，
+#     真实表直接吃 pg_dump 产物（每表用 source 指定文件，table 写 DDL 表名）；
+#   * 本文件决定「DDL 推不出的东西」：文件路径 / 加载策略 / 主键 / 外键 /
+#     行数哨兵，以及 numeric→Money/Price/Quantity、text→业务枚举的语义映射。
+#   * 列枚举类型名固定为 `<struct>Column`，不在此重复。
+#
+# [table.types] 里的值是 Rust 类型名：Money/Price/Quantity/MicroAmount 从
+# account::amount 导入，其余（IdType/AccountStatus…）从 crate::domain 导入。
+# numeric 列的映射优先级：types 逐列 > numeric_default 整表；两者都缺即报错（不猜）。
+#
+# register = false：只生成 struct 不登记进 TABLES（不加载、不校验）——
+# 真实库几十张表的渐进接入中间态，接一张登记一张。
+
+[[table]]
+id = "user_info"
+struct = "User"
+file = "dict/user.json"
+kind = "Dict"
+policy = "Critical"
+pk = ["user_id"]
+fk = []
+expected_rows = 3
+[table.types]
+id_type = "IdType"
+status = "UserStatus"
+
+[[table]]
+id = "account_info"
+struct = "Account"
+file = "state/account.json"
+kind = "Dict"
+policy = "Critical"
+pk = ["account_id"]
+fk = [["user_id", "user_info", "user_id"], ["account_id", "account_asset", "account_id"]]
+expected_rows = 3
+[table.types]
+status = "AccountStatus"
+
+[[table]]
+id = "dict_security"
+struct = "Security"
+file = "dict/security.json"
+kind = "Dict"
+policy = "Critical"
+pk = ["symbol"]
+fk = []
+expected_rows = 2
+[table.types]
+lot_size = "Quantity"
+price_tick = "Price"
+
+[[table]]
+id = "account_asset"
+struct = "Asset"
+file = "state/asset.json"
+kind = "State"
+policy = "Critical"
+pk = ["account_id"]
+fk = [["account_id", "account_info", "account_id"]]
+expected_rows = 3
+[table.types]
+available = "Money"
+frozen = "Money"
+total_market_value = "Money"
+
+[[table]]
+id = "position"
+struct = "Position"
+file = "state/position.json"
+kind = "State"
+policy = "Critical"
+pk = ["account_id", "symbol"]
+fk = [["account_id", "account_info", "account_id"], ["symbol", "dict_security", "symbol"]]
+expected_rows = 2
+[table.types]
+quantity = "Quantity"
+available_qty = "Quantity"
+avg_cost = "Price"
+
+# ---------------------------------------------------------------------------
+# 真实表（jzdb_prod，pg_dump 产物驱动）
+# ---------------------------------------------------------------------------
+
+# 产品单元资金交易表：第一张吃真实 DDL 的试点。所有 *_amt/*_fee/*_commis 都是金额，
+# 统一 numeric→Money —— 与 account::MemTbRowPdUnitCapitTrade 的既有裁决一致。
+# register=false：struct 已可编译，接进 Snapshot 与数据文件时改 true。
+[[table]]
+id = "tb_pdmage_pd_unit_capit_trade"
+struct = "PdUnitCapitTrade"
+source = "jzdb_prod_schema.sql"
+table = "tb_pdmage_pd_unit_capit_trade"
+register = false
+file = "state/tb_pdmage_pd_unit_capit_trade.json"
+kind = "State"
+policy = "Lazy"
+pk = ["row_id"]
+fk = []
+numeric_default = "Money"
+
+# ---------------------------------------------------------------------------
+# [[stub]] 整表搬入：把一份 dump 的全部表一键展开成占位 struct（机器裁决，固定规则）：
+#   * id = 物理表名；struct = 去 `tb_` 的全表名 Pascal（保留模块段 —— 跨模块同名表
+#     如 pdmage/pdswap 的 pd_unit_capit 不撞车）；
+#   * pk = row_id（缺则该表报错，指向 [[table]]/exclude 出路）；
+#   * numeric → Decimal 无损占位：库里 scale 从 2 到 12 都有（利率 8/12 位），
+#     统一落 Money(2) = 静默丢精度，违反铁律 4 —— 转正时逐列裁决成 Money/Price/Quantity；
+#   * register=false：不进 TABLES、不加载、不校验。
+# 转正一张表 = 在上方写一个同 source+table 的 [[table]] 块（stub 自动让位），重跑 `cargo codegen`。
+# ---------------------------------------------------------------------------
+
+[[stub]]
+source = "jzdb_prod_schema.sql"
+
+[[stub]]
+source = "jzdb_secu_schema.sql"
+
+[[stub]]
+source = "jzdb_base_schema.sql"
+# tb_error_log 是全库唯一的无 row_id 表（单列 remark_info 的日志黑洞表，无主键）：
+# 没有合理行键，不生成桩；将来要接它先得业务定身份列。
+exclude = ["tb_error_log"]
