@@ -127,7 +127,8 @@ fn demo_iterate(snapshot: &Snapshot) {
     dump_pk_columns(&snapshot.securities);
 }
 
-/// 内核写路径演示（阶段 1）：下单 → 冻结 → 先写 journal → 改内存 → 成交落账。
+/// 内核写路径演示（阶段 1）：下单 → 冻结 → 先写 journal → 改内存 → 成交落账，
+/// 最后用同一份 journal 做一次恢复回放（阶段 2.3）。
 ///
 /// 与上面两个只读样板不同，这里会真改内存镜像：为了不把演示结果写回 `data/`，
 /// 现取一份干净镜像喂给内核，journal 落在临时目录 —— 进程退出即丢，
@@ -137,6 +138,8 @@ fn demo_engine(root: &Path) {
 
     let mut path = std::env::temp_dir();
     path.push(format!("graydb-demo-{}.journal.jsonl", std::process::id()));
+    // 先清掉同名的上次残留：回放起点必须是「日初 + 仅本进程的流水」，否则 seq 不从 1 起。
+    let _ = std::fs::remove_file(&path);
     let journal = Journal::open(&path).expect("演示 journal 打开失败");
     let mut engine = Engine::new(Snapshot::load(root).expect("重新加载一份干净镜像"), journal);
 
@@ -181,6 +184,69 @@ fn demo_engine(root: &Path) {
     println!("  高价大额下单 → {rejected:?}，序号仍为 {seq_before}（拒单发生在写盘之前）");
     assert_eq!(engine.seq(), seq_before, "拒单不得消耗序号");
     engine.snapshot.check_valuation().expect("演示结束后市值仍应平");
+
+    // 阶段 2.3：拿同一份 journal 从「日初镜像」重放，结果必须与上面的内存逐分不差。
+    // 两边用的是同一套落账函数（冻结 / 结算 / 持仓 / 市值），对不上只可能出在流水本身。
+    println!("\n[8] 日志恢复：replay(日初镜像 + journal) == 崩溃前内存");
+    let recovery = Engine::recover(Snapshot::load(root).expect("重新加载日初镜像作回放起点"), &path)
+        .expect("演示 journal 完整，回放应成功重建终态");
+    let (live, reborn) = (&engine.snapshot, &recovery.engine.snapshot);
+    println!(
+        "  回放 {} 条记录，丢尾={}；序号 {} → {}，orders {} → {}，trades {} → {}",
+        recovery.replayed,
+        recovery.dropped_tail.is_some(),
+        engine.seq(),
+        recovery.engine.seq(),
+        live.orders.len(),
+        reborn.orders.len(),
+        live.trades.len(),
+        reborn.trades.len(),
+    );
+    let (live_asset, reborn_asset) = (
+        live.asset("A001").expect("A001 应有资产行"),
+        reborn.asset("A001").expect("回放后 A001 应有资产行"),
+    );
+    println!(
+        "  可用 {} ↔ {}，冻结 {} ↔ {}，市值 {} ↔ {}",
+        live_asset.available.format_fixed(2),
+        reborn_asset.available.format_fixed(2),
+        live_asset.frozen.format_fixed(2),
+        reborn_asset.frozen.format_fixed(2),
+        live_asset.total_market_value.format_fixed(2),
+        reborn_asset.total_market_value.format_fixed(2),
+    );
+    let (live_position, reborn_position) = (
+        live.position("A001", "600000").expect("成交后必有持仓行"),
+        reborn.position("A001", "600000").expect("回放后应有同一持仓行"),
+    );
+    println!(
+        "  新持仓 qty {} ↔ {}，可卖 {} ↔ {}，avg_cost {} ↔ {}",
+        live_position.quantity,
+        reborn_position.quantity,
+        live_position.available_qty,
+        reborn_position.available_qty,
+        live_position.avg_cost,
+        reborn_position.avg_cost,
+    );
+    assert_eq!(recovery.engine.seq(), engine.seq(), "恢复后的序号应接在崩溃前");
+    assert_eq!(recovery.engine.durable(), recovery.engine.seq(), "恢复后不得留空洞");
+    assert_eq!(reborn_asset.available, live_asset.available, "可用资金逐分不差");
+    assert_eq!(reborn_asset.frozen, live_asset.frozen, "冻结逐分不差");
+    assert_eq!(
+        reborn_asset.total_market_value,
+        live_asset.total_market_value,
+        "市值逐分不差"
+    );
+    assert_eq!(reborn_position.quantity, live_position.quantity);
+    assert_eq!(reborn_position.available_qty, live_position.available_qty);
+    assert_eq!(reborn_position.avg_cost, live_position.avg_cost);
+    assert_eq!(reborn.orders.len(), live.orders.len(), "订单行数一致");
+    assert_eq!(reborn.trades.len(), live.trades.len(), "成交行数一致");
+    recovery
+        .engine
+        .snapshot
+        .check_valuation()
+        .expect("回放后的市值同样该平");
 }
 
 /// 泛型遍历：编译期落到具体 `Table<T>`，运行时零擦除（没进 `dyn`，也没造行包装）。

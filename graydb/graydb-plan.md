@@ -1,6 +1,6 @@
 # GrayDB 推进计划
 
-> 最后更新：2026-09-29　|　分支：master　|　状态：**阶段 1（内核写路径）完成，下一步：阶段 2（日志与恢复）或 stub 逐表转正**
+> 最后更新：2026-09-30　|　分支：main　|　状态：**阶段 2（日志与恢复）完成（mmap 段文件与 group commit 摊销推到阶段 3 前），下一步：阶段 3（订阅分发）或 stub 逐表转正**
 
 ## 一、项目定位
 
@@ -49,13 +49,13 @@ GrayMarket/
     │   ├── dict/           security.json(2), user.json(3)
     │   └── state/          account.json(3), asset.json(3), position.json(2), order.json(0), trade.json(0)
     └── src/
-        ├── main.rs         启动入口（加载 + 启动报告 + 写路径样板 `demo_engine`）+ mock_data_tests(2)
+        ├── main.rs         启动入口（加载 + 启动报告 + 写路径样板 `demo_engine`（含恢复回放 `[8]`）+ mock_data_tests(2)
         ├── generated/      ← codegen 产物（签入库，勿手改）：299 文件 = 7 登记表演示 + 1 试点 + 289 stub 真实表 + specs(TABLES) + mod
         ├── tables.rs       注册中心：Spec / DataTable(+type Column,:RowValidator) / ColVal / ColumnName / RowValidator / load_table / FkIndex / TableStat + 写路径契约（upsert/replace/delete）+ tests(12)
         ├── domain/mod.rs   业务枚举 + 7 个 impl RowValidator（人写不变量，含 Order/Trade）+ pub use generated
-        ├── engine.rs       单线程内核写路径（阶段 1）：RejectReason / KernelError / Ack / place / apply_fill / cancel + tests(12)
+        ├── engine.rs       单线程内核：RejectReason / KernelError / Ack / place / apply_fill / cancel / **recover + replay_record**（阶段 2）+ tests(15)
         ├── mem.rs          Snapshot（强类型 `Table<T>` 字段，7 表）+ 声明式校验 + 资金三原语（`Result<(), RejectReason>`）+ tests(4)
-        └── journal.rs      JSONL 流水（std::io::Result），由 engine 独占写入
+        └── journal.rs      WAL：`Record{term,seq,entry}` / `Entry`（表名取自 `DataTable::ID`）/ `GroupWriter`（唯一写入口）/ `commit`（flush + `sync_data`）/ `read`（回放读取 + 截断判定）+ tests(2)
 ```
 
 ### 关键设计决策（已落地）
@@ -85,6 +85,12 @@ GrayMarket/
 | 扣减必须再过非负守卫 | `Amount::checked_sub` 只挡算术溢出，减成负数是 `Some(负值)`：金额层允许负（盈亏需要），余额/持仓语义不允许。所有扣减统一走 `engine::sub_or_negative`（资金三原语内部同口径 `filter(!is_negative)`）—— 否则「扣成负余额」与「成交量超委托」都判不出来 | 阶段 1（由守护测试抓出） |
 | 内核错误二分流 | `KernelError::Reject(RejectReason)`（业务可预期，走 ACK）/ `State(anyhow::Error)`（不变量崩塌）；journal 写失败与 seq 空洞**不进 `Result`**，直接 panic —— 返 `Err` 就会留下「序号已消耗、日志未落盘」的空洞 | `engine.rs` |
 | journal 记实体流水 | 落的是 order / trade 整行，不是 asset/position 的逐字段 delta；恢复（阶段 2）= 按流水重建余额，而非把日志数字往内存上抹 | `engine.rs` 模块头 |
+| 落账效应单一来源 | 阶段 2.3：把「下单效应 / 成交结算 / 撤单解冻」抽成 `apply_place_effect` / `settle_fill` / `apply_cancel_effect`，live 与回放调同一函数 —— `replay(journal) == 内存终态` 是**构造保证**而非两套算法碰巧算得一样；回放只跑效应，不重做校验、不再写盘 | `engine.rs` |
+| 恢复起点是日初镜像 | 日志记实体，资金/持仓由流水推导 → 重放必须从「orders/trades 为空、available 未扣」的日初镜像起，首条 seq 强制为 1；拿当日 `save()` 的脏镜像重放会重复冻结，直接拒收 | `Engine::recover` |
+| WAL 表名 = 注册中心身份 | `Entry` 的外部标签由变体名导出（`{"orders":{…}}`），`table_id()` 取 `DataTable::ID`，两者相等由测试钉住；信封里还带 `term`，跨 term / 行内 seq 与信封不符一律拒恢复 | `journal.rs` |
+| 截断丢尾必须上报 | 末条无换行 = 崩溃写在半路 → 丢弃该条并停止，`Recovery::dropped_tail` 非空代表「比崩溃前少一笔」，上层必须停服/对从库而不是接着撮合；中间行坏 / seq 不稠密 → `Err`，不做猜测式补齐 | 阶段 2.4 |
+| 稠密性按组而非按条 | 一个事务组本就同 seq 写两条（trade → order），合法序列是 `1,1,2,3,3…`；按「每条 +1」判会把正常日志误判为有洞 | 阶段 2.3（由守护测试抽出） |
+| 落盘 = flush + `sync_data` | `BufWriter::flush` 只到 OS 页缓存，不算落盘；`commit()` 额外 `sync_data`（不用 `sync_all`：不需刷 mtime，少一次元数据写） | 阶段 2.1b |
 | 市值全量重算 | 每次成交后 `recalc_market_value(account)` 按持仓现算，与 `check_valuation` 同一条算式；增量累加会漂移 | `engine.rs` |
 | 真实 pg_dump 多源接入 | 每表 `source`（sql 文件）+ `table`（DDL 名，可后缀匹配 schema 限定）；解析器吃多词类型/内联约束/IDENTITY/非建表语句；numeric 映射优先级 `types` 逐列 > `numeric_default` 整表，都缺即报错 | 阶段 0.8 |
 | `register=false` 迁移态 | 只生成 struct（含空 `RowValidator`，文件机器独占）不进 `TABLES`/不加载/不校验 —— 绕开「登记即须 Snapshot 字段+数据文件」的全套接入成本，真实表可一张一张搬 | 阶段 0.8 |
@@ -104,6 +110,9 @@ total_market_value = Σ(quantity × avg_cost)         ← `Snapshot::load` 即�
 quantity ≥ available_qty                            ← `impl RowValidator for Position`
 order.filled_qty ≤ order.quantity                    ← `impl RowValidator for Order`（部分成交不变量的单行部分）
 每笔写恰好消耗一个 seq，且「已分配 == 已落盘」            ← `engine::alloc_seq` / `commit_journal`（空洞即 panic）
+落盘 = flush + `sync_data`，只有它 Ok 才改内存              ← `journal::Journal::commit`（阶段 2.1b）
+replay(日初镜像 + journal) == 崩溃前内存（逐分不差）      ← `Engine::recover` + `state_fingerprint`（阶段 2.3 守护测试）
+journal 可采信的三个条件：表名已登记 / 行内 seq == 信封 seq / 组间 seq 稠密 ← `Journal::read`
 资金/市值 非负                                        ← `impl RowValidator for Asset`
 lot_size > 0 && price_tick > 0                       ← `impl RowValidator for Security`
 JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机械校验（`pk_parts` 已删）
@@ -115,7 +124,8 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 | 位置 | 测试 |
 |---|---|
 | `graydb/src/tables.rs` | 12 个守护测试：`table_ids_are_unique_and_match_files`、`every_declared_table_is_loaded_and_nonempty_or_marked`、`critical_table_missing_refuses_startup`、`optional_table_degrades_to_empty_and_is_marked`、`fk_violation_is_caught_from_declaration_only`、`primary_key_must_match_json_outer_key`、`composite_key_mixed_segments_render_stably`、`column_name_round_trips_and_rejects_unknown`、`int_primary_key_is_supported_end_to_end`、`generated_column_enums_cover_declared_columns`、`upsert_clears_old_index_values_on_reindex_column`（防线①）、`upsert_enforces_check_row_before_any_mutation`（防线②） |
-| `graydb/src/engine.rs` | 12 个全链路测试：`buy_fill_conserves_cash_position_and_seq`、`rejection_leaves_zero_state_delta`、`duplicate_order_id_is_idempotent_not_double_frozen`、`duplicate_trade_id_is_idempotent_not_double_settled`、`partial_fill_then_cancel_settles_exactly`、`partial_sell_fill_keeps_remaining_lock`、`t_plus_one_blocks_same_day_buy_from_selling`、`sell_fill_settles_lock_and_credit`、`fill_validation_rejects_bad_price_and_overfill`、`seq_is_monotonic_and_gapless`、`journal_records_the_whole_group_under_one_seq`、`weighted_avg_price_rounds_once_at_the_end` |
+| `graydb/src/engine.rs` | 15 个全链路测试：`buy_fill_conserves_cash_position_and_seq`、`rejection_leaves_zero_state_delta`、`duplicate_order_id_is_idempotent_not_double_frozen`、`duplicate_trade_id_is_idempotent_not_double_settled`、`partial_fill_then_cancel_settles_exactly`、`partial_sell_fill_keeps_remaining_lock`、`t_plus_one_blocks_same_day_buy_from_selling`、`sell_fill_settles_lock_and_credit`、`fill_validation_rejects_bad_price_and_overfill`、`seq_is_monotonic_and_gapless`、`journal_records_the_whole_group_under_one_seq`（读回取证信封：seq 稠密 + 表名 + 行内 seq）、`weighted_avg_price_rounds_once_at_the_end`、`replay_reconstructs_the_exact_final_state`（阶段 2.3 守护）、`replay_drops_partial_tail_and_stops_at_the_last_complete_record`（阶段 2.4）、`replay_refuses_interior_corruption_and_seq_gap`（坏日志一律拒收） |
+| `graydb/src/journal.rs` | `table_tag_matches_registry_identity`（serde 外部标签 == `DataTable::ID` == `Spec::id`）、`record_round_trips_with_envelope`（`{term,seq,entry}` 写读往返） |
 | `graydb/src/mem.rs` | `loads_all_mock_json_into_memory`（7 表，orders/trades 日初为空）、`tradability_respects_account_and_dict`、`freeze_conserves_available_plus_frozen`（含 `checked_sub` 允许负值的拦截）、`composite_key_is_stable_and_matches_json_layout` |
 | `graydb/src/main.rs` | `all_mock_json_files_match_domain_structs`（改用 `Snapshot::load`）、`asset_invariants_hold`（测试自行复算市值，不复用生产实现） |
 | `account/src/amount.rs` | 32 个：标度显示 / 边界 / widen-narrow / 5 种舍入 / Decimal 互转 / notional / 三段式落账 / settle 错误 / 序列化格式 / 越界拒绝 / 枚举 snake_case |
@@ -275,12 +285,27 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 - **守护测试抽出的真缺陷（两个，同一根因）**：`Amount::checked_sub` 只挡算术溢出，减成负数是 `Some(负值)`。于是 ① 资金原语能把 `available` 扣成负数（旧 `-> bool` 测试也没发现，因为它只测了溢出分支）；② `apply_fill` 拿 `quantity.checked_sub(fill_qty)` 判「超量成交」永远不成立（OverFill 分不出），反而在下游报成 `FrozenUnderflow`。修法：所有扣减再过一道 `!is_negative`（`engine::sub_or_negative`），超量改用 `Ord` 比较。这类「金额层允许负、余额语义不允许负」的缺口，单看 `amount.rs` 的 API 看不出来，必须靠带真实数值的守恒测试反推。
 - 遗留 6–9 全部关闭；`Order.seq` 类型由手写时代的 `u64` 统一为 codegen 从 DDL `bigint` 推出的 `i64`（`Seq` 列不开放取值：不在 pk/fk 声明里，`column()` 返回 `None`）；`expected_rows = 0` 是**日初**哨兵，当日撮合后 `save()` 回盘再 `load()` 会被行数哨兵拒启 —— 跨日重启需先做日切归档（阶段 2/4 一并处理）。
 
-### 阶段 2：日志与恢复
+### ✅ 阶段 2：日志与恢复（已完成 2.1 / 2.1b / 2.1c / 2.3 / 2.4，mmap 段文件与 group commit 摊销推迟）
 
-- 2.1 JSONL 升级为 `(term, seq)` 段文件布局（mmap 追加写）；记录携带 `table: &'static str`（取自 `Spec::id`），回放按表分流；
-- 2.2 group commit：攒批 `sync_all`，量化 µs 级摊销；
-- 2.3 **回放恢复测试**：`replay(journal) == 内存终态`，逐分不差（整个 WAL 设计的守护测试）；
-- 2.4 崩溃截断：末条记录不完整时丢弃并停止，不做「猜测式补齐」。
+目标：让「先写日志再改内存」真的守得住 —— 范围裁决为先做**恢复语义**（信封 + 真落盘 + 回放守护测试 + 截断处置），性能改造推到阶段 3 前（现在只需顺序回放，mmap 与攒批的收益要等按 `seq` 随机补发时才兑现）。
+
+| 任务 | 说明 |
+|---|---|
+| 2.1 WAL 信封 | `Record{term, seq, entry}` 一行一条，`entry` 是 `Entry::{Orders, Trades}` 外部标签 enum（落盘形如 `{"term":0,"seq":1,"entry":{"orders":…整行…}}`）。表名不另写字面量：`Entry::table_id()` 取 `DataTable::ID`，与 serde 由变体名导出的标签由 `table_tag_matches_registry_identity` 钉死相等 → WAL 表名 == 注册中心 == 订阅 topic == PG 表名，不可能写岔 |
+| 2.1b 真落盘 | `Journal::commit()` = `BufWriter::flush` + `File::sync_data`（不用 `sync_all`：不需要刷 mtime，少一次元数据写）。阶段 1.5 那句「先写日志再改内存」的「写」到这一层才算真的写完 |
+| 2.1c 唯一写入口 | `GroupWriter{journal, term, seq}` 字段全私有、只有 `pub(crate) fn new`：一个事务组内 `group.trade(…)?; group.order(…)` 都盖同一个 seq —— 「带信封写入」是结构上唯一的路，「忘了 sync」写不出来 |
+| 2.3 回放恢复 | `Engine::recover(day_open_snapshot, path) -> Recovery{engine, replayed, dropped_tail}`。`replay_record` 分流：orders 首见 = 下单流水（重新冻结）、再见 = 只搬行（仅「活单 → Cancelled」那一跳施加解冻）、trades = 结算 + `upsert`（trade 记录排在同组 order 之前，故成交时表里仍是**成交前**那行，委托价/可卖量与当时一致）。落账效应抽成 `apply_place_effect` / `settle_fill` / `apply_cancel_effect`，live 与回放调同一函数 —— `replay == 终态` 是构造保证而非两套算法碰巧算得一样 |
+| 2.4 截断与拒收 | `Journal::read` 的采信判定：末条无换行 = 崩在写入中途 → 丢弃并停止（`dropped_tail` 上报，非空代表比崩溃前少一笔，上层必须停服 / 对从库而不是接着撮合）；中间行解析失败 / 表名未登记 / 行内 seq ≠ 信封 seq / 组间 seq 不稠密 / 跨 term → 直接 `Err`，不做「猜测式补齐」 |
+| 2.2 group commit | ⏸ 推迟：当前每笔一次 `sync_data`，正确性已足；攒批摊销要等阶段 3 有多消费者压力测试再量化 |
+| 2.5 mmap 段文件 | ⏸ 推迟：`(term, seq)` 段文件 + 按 seq 随机读的收益要等阶段 3 补发（ring buffer 溢出后回读段文件）才兑现 |
+
+**验收结果**（2026-09-30）：
+
+- `cargo test --workspace` **71 passed**（account 32 + graydb 35 + codegen 4），其中 `journal.rs` 新增 2 个、`engine.rs` 12 → 15（回放三件）；`cargo clippy --workspace --all-targets` 零警告；`cargo run -p graydb` 新增 `[8] 日志恢复` 一段：回放 3 条记录、丢尾=false，序号 2 → 2、orders 1→1、trades 1→1，可用 992192.00 ↔ 992192.00、冻结 0.00 ↔ 0.00、市值 7808.00 ↔ 7808.00，持仓 qty 100 ↔ 100、可卖 0 ↔ 0、avg_cost 6.06 ↔ 6.06，恢复后的引擎还能继续 `place`。
+- 比对口径：`state_fingerprint` 用 `serde_json::to_value` 把四张可变表（assets / positions / orders / trades）整表取出来逐字段比（`Amount` 序列化为 `{"units":N}` 纯整数，故「指纹相等」== 逐分不差），不是挑几个字段抽查。
+- **守护测试抽出的三个真问题**：① `BufWriter::flush` 不是落盘（阶段 1 遗留，无 fsync → 掉电丢已 ACK 的组）→ 2.1b 补 `sync_data`；② 稠密性最初按「每条记录 +1」判定，而 1.7 的事务组本就同 seq 写两条，正常日志被误判有洞 → 改成 `seq == last.seq || last.seq + 1`（合法序列 `1,1,2,3,3…`）；③ 误以为 `#[serde(rename_all)]` 会产出内部字段 `"table"`，普通 enum 得到的是**外部标签** → 表名校验改走 `Entry::table_id()`，测试断言 entry 对象的唯一键。
+- 口径纠正：`Recovery::replayed` 数的是**记录条数**（该场景 11 条），`seq` 数的是**事务组数**（8 组）—— 三个成交组各 2 条，两者天然不相等。
+- 遗留（不在本阶段做）：恢复起点强制「日初镜像 + 首条 seq=1」（拿当日 `save()` 的脏镜像重放会重复冻结，`recover` 直接拒收），而 `expected_rows` 的日初哨兵使脏镜像无法 `load()` → 真跨日重启需先做日切归档（阶段 4 接 PG 时一并处理）；跨 term 日志与从库接管属阶段 5。
 
 ### 阶段 3：订阅分发
 
@@ -319,12 +344,13 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 ```powershell
 cargo test                      # 全 workspace
 cargo test -p account           # 定点数与序列化测试
-cargo test -p graydb            # 守护 10 + mem 4 + mock 2 = 16 个测试
+cargo test -p graydb            # 35 个测试：tables 12 + engine 15 + journal 2 + mem 4 + mock 2
 cargo test -p graydb tables::    # 只跑表清单/注册中心守护测试
-cargo test -p graydb mem::     # 只跑内存镜像测试
+cargo test -p graydb engine::    # 只跑内核写路径与回放恢复测试
+cargo test -p graydb journal::   # 只跑 WAL 信封 / 落盘 / 截断判定测试
 cargo clippy --workspace --all-targets
 cargo codegen                   # 改 DDL/tables.toml 后重生成 graydb/src/generated（= run -p codegen）
-cargo run -p graydb             # 加载 + 按 TABLES 打印启动报告
+cargo run -p graydb             # 加载 + 按 TABLES 打印启动报告 + `[7]` 写路径 + `[8]` 日志恢复
 cargo run                       # 根 package GrayMarket
 ```
 
@@ -345,7 +371,8 @@ RustRover：Cargo 面板 → `graydb > tests` 可批量运行；`Cargo.toml` 变
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 日终落库当作唯一持久化 | 崩溃丢失当日全部订单 | 阶段 2 的 WAL + 阶段 5 同步复制 |
+| 日终落库当作唯一持久化 | 崩溃丢失当日全部订单 | 阶段 2 WAL + 回放已具备（`replay(日初镜像 + journal) == 崩溃前内存`）；阶段 5 同步复制从库 |
+| 把 `BufWriter::flush` 当落盘 | 数据只到 OS 页缓存，掉电/kill 后丢掉已回 ACK 的事务组 | ✅ 已缓解（阶段 2.1b）：落盘 = `flush` + `sync_data`，且只有它 `Ok` 才改内存 |
 | 主从异步复制 | 已 ACK 的订单被抹掉 | 阶段 5.1 |
 | 无仲裁的主从 | 脑裂双写，比丢数据更严重 | 阶段 5.2 fencing |
 | 双舍入（先中间标度再目标标度） | 差一分钱，清算时才发现 | `convert` 一次完成 + `amount.rs` 测试锁定 |
