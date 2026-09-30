@@ -1,5 +1,5 @@
-//! 订阅出口（阶段 3.1 + 3.2 + 3.3 + 3.6）：内核的行变更按事务组定序进有界 ring，读者按游标自己拉；
-//! [`Subscribe`] / [`Frame`] / [`Subscriber`] 是对外协议层，快照与增量共用同一份过滤与裁列口径。
+//! 订阅出口（阶段 3.1 + 3.2 + 3.3 + 3.5 + 3.6）：内核的行变更按事务组定序进有界 ring，读者按游标自己拉；
+//! [`Subscribe`] / [`Topic`] / [`Frame`] / [`Subscriber`] 是对外协议层，快照与增量共用同一份过滤与裁列口径。
 //!
 //! 与原计划的偏差一处：不用 `tokio::sync::broadcast`，改成「有界 ring + 消费者游标」。
 //! 理由不是省事 —— 推送式广播会把「消费者速度」变成写路径的一部分（订阅者慢 → channel
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::AssetColumn;
 use crate::mem::Snapshot;
-use crate::tables::{ColumnName, spec_of};
+use crate::tables::{ColumnName, Spec, TABLES, spec_of};
 
 /// 默认容量，单位是**行**而不是组：一组成交最多牵动四张表各一行，
 /// 8192 行约合 2000 组的补发窗口。真正的内存预算要等 3.4 有多消费者压测再定。
@@ -350,18 +350,140 @@ impl Columns {
     }
 }
 
+/// 订阅主题：客户端指向「一张表」或「一组表」的唯一语法。
+///
+/// 三档形状全带 `table:` 前缀 —— 前缀说的是这一档主题的**种类**，留给将来（阶段 6 的分析出口
+/// 一类）而不必改动现有语法。因此裸表名会被明确拒绝，而不是被猜成表名：猜错了的订阅会安静地
+/// 收到一份不属于任何人的历史，比当场报错贵得多。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Topic {
+    /// `table:{spec.id}`：一张已登记的表。
+    Exact { table: String },
+    /// `table:{schema}.*`：`Spec::schema` 恰为该名的全部登记表。
+    ///
+    /// schema 的事实源是 codegen 从 `tables.toml` 的 `source` 文件名剥出来的，**不从表名猜前缀**；
+    /// mock 表是 `None`，所以它们永不命中这一档。
+    Schema { schema: String },
+    /// `table:*`：注册中心里的全部表。
+    All,
+}
+
+impl Topic {
+    /// 解析主题串。语法错、前缀不对、通配放错位置，一律给结构化拒因 ——
+    /// 「订不到」与「订错东西」必须当场分得开。
+    pub fn parse(raw: &str) -> Result<Self, SubscribeError> {
+        let bad = |reason: &'static str| SubscribeError::BadTopic {
+            topic: raw.to_string(),
+            reason,
+        };
+        let Some(rest) = raw.strip_prefix("table:") else {
+            return Err(bad(
+                "必须以 table: 开头，三档形状是 table:{表名} / table:{schema}.* / table:*",
+            ));
+        };
+        if rest == "*" {
+            return Ok(Topic::All);
+        }
+        if let Some(schema) = rest.strip_suffix(".*") {
+            if schema.is_empty() {
+                return Err(bad("table:{schema}.* 的 schema 段不能为空"));
+            }
+            if schema.contains('*') {
+                return Err(bad("通配符只能出现在主题末尾的 .* 处"));
+            }
+            return Ok(Topic::Schema {
+                schema: schema.to_string(),
+            });
+        }
+        if rest.contains('*') {
+            return Err(bad("通配符只能写成 table:* 或 table:{schema}.*"));
+        }
+        if rest.is_empty() {
+            return Err(bad("table: 后面必须跟表名、{schema}.* 或 *"));
+        }
+        if rest.contains('.') {
+            return Err(bad(
+                "精确主题只认裸表名（`Spec::id` 不带 schema 限定）；要按库订请用 table:{schema}.*",
+            ));
+        }
+        Ok(Topic::Exact {
+            table: rest.to_string(),
+        })
+    }
+}
+
+/// 把主题展开成注册中心里的具体表 —— **纯函数，注册中心作入参**。
+///
+/// 为什么要把注册中心做成参数：今天 `TABLES` 里 7 张全是 mock 表（`schema = None`），289 张真实
+/// 表一律 `register = false` 不入库，所以 `table:{schema}.*` 在真注册中心上恒命中零张。通配语义
+/// 必须由假表清单钉住，而不是留一句「等阶段 4 再说」。生产路径固定传 `TABLES`。
+pub fn expand_topics(
+    topics: &[String],
+    registry: &'static [Spec],
+) -> Result<Vec<&'static str>, SubscribeError> {
+    Ok(expand_specs(topics, registry)?
+        .into_iter()
+        .map(|spec| spec.id)
+        .collect())
+}
+
+/// 同 [`expand_topics`]，但要的是整份 `Spec`（`validate` 还得拿它查主键与列名）。
+pub fn expand_specs(
+    topics: &[String],
+    registry: &'static [Spec],
+) -> Result<Vec<&'static Spec>, SubscribeError> {
+    let mut found: Vec<&'static Spec> = Vec::new();
+    for raw in topics {
+        let topic = Topic::parse(raw)?;
+        let matched: Vec<&'static Spec> = match &topic {
+            Topic::All => registry.iter().collect(),
+            Topic::Schema { schema } => registry
+                .iter()
+                .filter(|spec| spec.schema == Some(schema.as_str()))
+                .collect(),
+            Topic::Exact { table } => registry
+                .iter()
+                .filter(|spec| spec.id == table.as_str())
+                .collect(),
+        };
+        if matched.is_empty() {
+            // 命中零张 = 名字写错，或那个库尚未接进来。当场拒，别留一个「订了但永远收不到东西」的
+            // 订阅 —— 它在消费者眼里与「订阅成功但确实没有变更」长得一模一样。
+            return Err(match topic {
+                Topic::Exact { table } => SubscribeError::UnknownTable(table),
+                Topic::Schema { schema } => SubscribeError::EmptyTopicMatch {
+                    topic: raw.to_string(),
+                    hint: format!("注册中心里没有 schema 为 {schema:?} 的表"),
+                },
+                Topic::All => SubscribeError::EmptyTopicMatch {
+                    topic: raw.to_string(),
+                    hint: "注册中心是空的".to_string(),
+                },
+            });
+        }
+        for spec in matched {
+            // 去重：`table:*` 与 `table:orders` 同时出现只算一张 —— 不去重就会下两遍快照，
+            // 消费者的镜像在第二遍 begin 上撞 `DuplicateBegin`。
+            if !found.iter().any(|kept| kept.id == spec.id) {
+                found.push(spec);
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// 订阅请求。默认值 = 最保守也最常用的一份：全表快照、两种 op、全列、不过滤。
 ///
 /// 出站与入站都走 JSON：入站是 3.4 的网络请求体，字段全为拥有型（`Vec<String>`），
 /// 所以能直接 `from_str`。`deny_unknown_fields` 只加在**请求**上：客户端把
-/// `tabels` 拼错必须当场报错，而不是静悄悄按「没过滤全表」跑起来 ——
+/// `topics` 拼错必须当场报错，而不是静悄悄按「没过滤全表」跑起来 ——
 /// 帧（出站）反过来允许未知字段，好让旧消费者读得到新增字段（见 `wire.rs`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Subscribe {
-    /// 表身份清单（`Spec::id`），由 [`Subscribe::validate`] 逐项核对注册中心。
-    /// 省略 = 空清单，到 `validate` 被 `EmptyTables` 拒；不做「省略就订全部」的猜测。
-    pub tables: Vec<String>,
+    /// 主题清单（[`Topic`] 的三档形状之一），由 [`Subscribe::validate`] 展开成具体表并逐项核对注册中心。
+    /// 省略 = 空清单，到 `validate` 被 `EmptyTopics` 拒；不做「省略就订全部」的猜测。
+    pub topics: Vec<String>,
     /// 关心哪些动作；只订 `Delete` 时不得再要快照（快照本质全是 `Upsert`）。
     /// 省略 = 两种都要（与 `Default` 的「最保守也最常用」一致）。
     #[serde(default = "all_ops")]
@@ -376,10 +498,24 @@ fn all_ops() -> Vec<Op> {
 }
 
 impl Subscribe {
+    /// 按表身份建订阅：每个元素就是一个 `Spec::id`，包成 `table:{id}` 主题。
+    /// 要写通配就走 [`Subscribe::of_topics`]（反序列化收到的那条路也是它）。
     #[must_use]
     pub fn new(tables: &[&str]) -> Self {
         Self {
-            tables: tables.iter().map(|table| (*table).to_string()).collect(),
+            topics: tables.iter().map(|table| format!("table:{table}")).collect(),
+            ops: vec![Op::Upsert, Op::Delete],
+            snapshot: SnapshotMode::Full,
+            columns: Columns::default(),
+            filter: Filter::None,
+        }
+    }
+
+    /// 原样收下主题串：`table:*` / `table:{schema}.*` / `table:{id}` 三档都能写。
+    #[must_use]
+    pub fn of_topics(topics: &[&str]) -> Self {
+        Self {
+            topics: topics.iter().map(|topic| (*topic).to_string()).collect(),
             ops: vec![Op::Upsert, Op::Delete],
             snapshot: SnapshotMode::Full,
             columns: Columns::default(),
@@ -413,9 +549,11 @@ impl Subscribe {
 
     /// 请求 → 可服务的表身份。所有「客户端能写错的地方」都在这一个函数里拒绝，
     /// 过了就保证 [`Engine::subscribe`][crate::engine::Engine::subscribe] 能出完整快照。
+    ///
+    /// 主题就在这一步展开成具体表清单：展开是一次性的，此后新表登记不会悄悄进来。
     pub fn validate(&self) -> Result<Vec<&'static str>, SubscribeError> {
-        if self.tables.is_empty() {
-            return Err(SubscribeError::EmptyTables);
+        if self.topics.is_empty() {
+            return Err(SubscribeError::EmptyTopics);
         }
         if self.ops.is_empty() {
             return Err(SubscribeError::EmptyOps);
@@ -425,15 +563,14 @@ impl Subscribe {
         {
             return Err(SubscribeError::SnapshotNeedsUpsert);
         }
-        let mut tables = Vec::with_capacity(self.tables.len());
-        for table in &self.tables {
-            let spec = spec_of(table).ok_or_else(|| SubscribeError::UnknownTable(table.clone()))?;
+        let specs = expand_specs(&self.topics, TABLES)?;
+        for spec in specs.iter() {
             // 主键首列必须是账户列，否则本表无法按账户分流（`Delete` 无从归属）。
             if matches!(self.filter, Filter::Accounts(_))
                 && spec.pk.first().copied() != Some(account_column())
             {
                 return Err(SubscribeError::FilterNotSupported {
-                    table: table.clone(),
+                    table: spec.id.to_string(),
                 });
             }
             if !self.columns.is_all() {
@@ -441,15 +578,14 @@ impl Subscribe {
                 for column in &self.columns.0 {
                     if !declared.contains(&column.as_str()) {
                         return Err(SubscribeError::UnknownColumn {
-                            table: table.clone(),
+                            table: spec.id.to_string(),
                             column: column.clone(),
                         });
                     }
                 }
             }
-            tables.push(spec.id);
         }
-        Ok(tables)
+        Ok(specs.into_iter().map(|spec| spec.id).collect())
     }
 }
 
@@ -578,14 +714,18 @@ impl Subscriber {
 /// 拒绝订阅的结构化原因：每一条都指认到「哪个字段写错了」，不退成一个 `InvalidRequest`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscribeError {
-    /// 一张表都没订 —— 多半是把表名填进了别的字段。
-    EmptyTables,
+    /// 一个主题都没写 —— 多半是把表名填进了别的字段。
+    EmptyTopics,
     /// 没订任何动作，那这个订阅永远收不到东西。
     EmptyOps,
     /// 只要 `Delete` 却要快照：快照里的行本质全是 `Upsert`，两者矛盾。
     SnapshotNeedsUpsert,
     /// 表名未登记（与 WAL / COPY 同一道防线：表身份只认 `Spec::id`）。
     UnknownTable(String),
+    /// 主题串本身不是合法形状：前缀不对、通配符放错了位置，或把 schema 限定写进了精确名。
+    BadTopic { topic: String, reason: &'static str },
+    /// 主题合法但注册中心里一张都没命中：多半是 schema 名拼错，或那个库尚未接表。
+    EmptyTopicMatch { topic: String, hint: String },
     /// 该表主键首列不是 `account_id`，无法按账户分流（`Delete` 不带行值，靠列值判不了归属）。
     FilterNotSupported {
         table: String,
@@ -600,13 +740,19 @@ pub enum SubscribeError {
 impl fmt::Display for SubscribeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SubscribeError::EmptyTables => write!(f, "订阅请求未指定任何表"),
+            SubscribeError::EmptyTopics => write!(f, "订阅请求未指定任何主题（topics）"),
             SubscribeError::EmptyOps => write!(f, "订阅请求未指定任何动作（ops）"),
             SubscribeError::SnapshotNeedsUpsert => {
                 write!(f, "要快照就必须订 Upsert：快照行全是 Upsert，只订 Delete 接不到初始状态")
             }
             SubscribeError::UnknownTable(table) => {
                 write!(f, "表 {table:?} 未在注册中心登记，拒绝订阅")
+            }
+            SubscribeError::BadTopic { topic, reason } => {
+                write!(f, "主题 {topic:?} 不是合法形状：{reason}")
+            }
+            SubscribeError::EmptyTopicMatch { topic, hint } => {
+                write!(f, "主题 {topic:?} 一张表都没命中（{hint}），拒绝订阅")
             }
             SubscribeError::FilterNotSupported { table } => write!(
                 f,
@@ -699,11 +845,11 @@ mod tests {
     /// 3.2 订约边界：非法请求必须在 attach 时被结构化拒掉，而不是接了之后少发多。
     #[test]
     fn bad_subscribe_requests_are_refused_at_attach() {
-        // 一张表都没订：多半是把表名填到了别的字段里。
+        // 一个主题都没写：多半是把表名填到了别的字段里。
         assert_eq!(
             Subscribe::new(&[]).validate(),
-            Err(SubscribeError::EmptyTables),
-            "空表清单不能算「订全部」"
+            Err(SubscribeError::EmptyTopics),
+            "空主题清单不能算「订全部」"
         );
         assert_eq!(
             Subscribe::new(&["orders"]).ops(&[]).validate(),
@@ -850,5 +996,157 @@ mod tests {
         );
         let json = serde_json::to_value(Frame::RebuildRequired { lost_through: 2 }).expect("编码");
         assert_eq!(json["rebuild_required"]["lost_through"], 2);
+    }
+
+    // ── 3.5 主题粒度 ────────────────────────────────────
+
+    use crate::tables::{Kind, LoadPolicy};
+
+    /// 假注册中心：真 `TABLES` 里七张全是 mock 表（`schema = None`），289 张真实表一律
+    /// `register = false` 还没入库，所以 `table:{schema}.*` 这一档只能在这里被钉住。
+    /// 「等阶段 4 有真数据再验」等于永不验证。
+    static SCHEMA_REGISTRY: &[Spec] = &[
+        Spec {
+            id: "pd_unit_capit_trade",
+            schema: Some("jzdb_prod"),
+            file: "state/pd_unit_capit_trade.json",
+            kind: Kind::State,
+            policy: LoadPolicy::Critical,
+            pk: &["row_id"],
+            fk: &[],
+            expected_rows: None,
+        },
+        Spec {
+            id: "secu_type",
+            schema: Some("jzdb_secu"),
+            file: "dict/secu_type.json",
+            kind: Kind::Dict,
+            policy: LoadPolicy::Critical,
+            pk: &["secu_type_code"],
+            fk: &[],
+            expected_rows: None,
+        },
+        Spec {
+            id: "legacy_no_schema",
+            schema: None,
+            file: "state/legacy_no_schema.json",
+            kind: Kind::State,
+            policy: LoadPolicy::Optional,
+            pk: &["row_id"],
+            fk: &[],
+            expected_rows: None,
+        },
+    ];
+
+    fn ids(topics: &[&str], registry: &'static [Spec]) -> Result<Vec<&'static str>, SubscribeError> {
+        let parsed: Vec<String> = topics.iter().map(|topic| (*topic).to_string()).collect();
+        expand_topics(&parsed, registry)
+    }
+
+    /// 三档形状各自展开成什么，以及通配与精确名重叠时只算一张。
+    #[test]
+    fn topics_expand_to_table_sets_in_registry_order() {
+        assert_eq!(
+            ids(&["table:secu_type"], SCHEMA_REGISTRY).expect("精确名应展开"),
+            vec!["secu_type"],
+            "精确主题就该只命中那一张"
+        );
+        assert_eq!(
+            ids(&["table:jzdb_prod.*"], SCHEMA_REGISTRY).expect("schema 通配应展开"),
+            vec!["pd_unit_capit_trade"],
+            "schema 通配只命中带这个 schema 的表，不许把 schema 为 None 的 mock 表也捞进来"
+        );
+        assert_eq!(
+            ids(&["table:*"], SCHEMA_REGISTRY).expect("全库应展开"),
+            vec!["pd_unit_capit_trade", "secu_type", "legacy_no_schema"],
+            "table:* 就是注册中心全部，顺序即声明顺序"
+        );
+        // 重叠不去重就会下两遍快照：消费者的镜像在第二道 begin 上撞 `DuplicateBegin`。
+        assert_eq!(
+            ids(
+                &["table:*", "table:pd_unit_capit_trade", "table:jzdb_secu.*"],
+                SCHEMA_REGISTRY
+            )
+            .expect("重叠主题应展开"),
+            vec!["pd_unit_capit_trade", "secu_type", "legacy_no_schema"],
+            "通配与精确名重叠只算一张"
+        );
+    }
+
+    /// 名字写错与「那个库还没接进来」都必须当场拒：空命中的订阅与「订到了但确实没变更」长得一样。
+    #[test]
+    fn a_topic_matching_nothing_is_refused_rather_than_silently_empty() {
+        assert!(
+            matches!(
+                ids(&["table:jzdb_base.*"], SCHEMA_REGISTRY),
+                Err(SubscribeError::EmptyTopicMatch { .. })
+            ),
+            "假注册中心里没有 jzdb_base，空命中要报错而不是给一个永久静默的订阅"
+        );
+        assert_eq!(
+            ids(&["table:pd_unit"], SCHEMA_REGISTRY),
+            Err(SubscribeError::UnknownTable("pd_unit".to_string())),
+            "精确名写错要指认到表"
+        );
+        // 真注册中心今天一张带 schema 的表都没有：这一档在阶段 4 之前恒为空，
+        // 而「恒为空」必须由拒订表达，不能编一条通配假装命中。
+        assert!(
+            matches!(
+                Subscribe::of_topics(&["table:jzdb_prod.*"]).validate(),
+                Err(SubscribeError::EmptyTopicMatch { .. })
+            ),
+            "真实库尚未接表时，按 schema 订就该被当场拒"
+        );
+    }
+
+    /// 主题语法把「能被猜错的地方」全堵死：缺前缀、空段、通配放错位、把 schema 写进精确名。
+    #[test]
+    fn every_ambiguous_topic_shape_is_rejected_at_parse() {
+        for raw in [
+            "orders",                    // 缺前缀：猜成表名就等于「猜错了也收得到东西」
+            "dict:secu_type",            // 别的种类还没定，不得悄悄当成 table: 走
+            "table:",                    // 空段
+            "table:.*",                  // schema 段为空
+            "table:ord*ers",             // 通配符放错了位置
+            "table:jzdb_prod.*extra",    // 通配符不在末尾
+            "table:jzdb_prod.secu_type", // 精确名不带 schema 限定
+        ] {
+            let err = Topic::parse(raw).expect_err("这个形状该被拒");
+            assert!(matches!(err, SubscribeError::BadTopic { .. }), "{raw:?} 实得：{err}");
+        }
+        // 合法的三档各自解成什么，写在这里免得日后有人「顺手放宽」。
+        assert_eq!(Topic::parse("table:*").expect("全库主题"), Topic::All);
+        assert_eq!(
+            Topic::parse("table:jzdb_prod.*").expect("schema 主题"),
+            Topic::Schema { schema: "jzdb_prod".to_string() }
+        );
+        assert_eq!(
+            Topic::parse("table:orders").expect("精确主题"),
+            Topic::Exact { table: "orders".to_string() }
+        );
+    }
+
+    /// 通配不得绕过逐张表的策略闸门：展开出来的每张表仍要过 3.2 那套主键 / 列名核对。
+    #[test]
+    fn a_wildcard_does_not_slip_past_the_per_table_guards() {
+        let wildcard = Subscribe::of_topics(&["table:*"]).accounts(&["A001"]).validate();
+        let explicit = Subscribe::new(&TABLES.iter().map(|spec| spec.id).collect::<Vec<_>>())
+            .accounts(&["A001"])
+            .validate();
+        // 同一份表集，只是写法不同：通配不能比逐个精确名更宽，也不能给出不一样的拒因。
+        assert_eq!(wildcard, explicit, "通配展开后的口径应与逐个精确名完全一致");
+        assert!(
+            matches!(wildcard, Err(SubscribeError::FilterNotSupported { .. })),
+            "全库订阅带账户过滤本该被拒（TABLES 里有表的主键首列不是账户列）"
+        );
+        // 同一条通配不要过滤就合法，且展开出全部登记表。
+        assert_eq!(
+            Subscribe::of_topics(&["table:*"])
+                .validate()
+                .expect("全库订阅应放行")
+                .len(),
+            TABLES.len(),
+            "table:* 应展开成注册中心的全部表"
+        );
     }
 }

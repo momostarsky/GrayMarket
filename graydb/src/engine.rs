@@ -2266,6 +2266,35 @@ mod tests {
             .collect()
     }
 
+    /// 3.5：`table:*` 在 attach 那一刻展开成当时的全部登记表，快照正好覆盖它们 ——
+    /// 一道不多（重复 begin 会被消费者判协议畸形），一道不少（少一道就是静默少一张表）。
+    #[test]
+    fn a_wildcard_snapshot_covers_exactly_the_tables_expanded_at_attach() {
+        let eng = engine("proto-topic");
+        let declared: Vec<&'static str> = crate::tables::TABLES.iter().map(|spec| spec.id).collect();
+        let (sub, frames) = eng
+            .subscribe(Subscribe::of_topics(&["table:*"]))
+            .expect("全库主题应放行");
+        assert_eq!(sub.tables(), declared, "订阅者存的应是展开后的表集而不是主题串");
+
+        let begins: Vec<&'static str> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::SnapshotBegin { table, .. } => Some(*table),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<&'static str> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::SnapshotEnd { table, .. } => Some(*table),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(begins, ends, "每张表都该有一道配对屏障，且不重复");
+        assert_eq!(begins.len(), declared.len(), "屏障道数应等于 attach 时展开出的表数");
+    }
+
     /// 3.2 核心验收：只按帧序列重建出的消费者镜像，每一步都与内核当前镜像逐行相等。
     /// 快照与增量的交接不重不漏就在这一个 oracle 里：漏一行则镜像少一行，重一行则内容对不上。
     #[test]

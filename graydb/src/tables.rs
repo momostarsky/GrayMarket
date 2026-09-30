@@ -34,6 +34,11 @@ pub enum LoadPolicy {
 pub struct Spec {
     /// 唯一身份，贯穿内存表 / WAL 记录 / 订阅主题 / PG 表名 / COPY 目标。
     pub id: &'static str,
+    /// 真实库里的 schema 名（codegen 从 `tables.toml` 的 `source` 文件名剥出，如 `jzdb_prod`）。
+    ///
+    /// `None` = 只由手写 `sql/schema.sql` 描述的 mock 表，它不属于任何真实 schema。
+    /// 订阅主题 `table:{schema}.*` 只按这个字段匹配，绝不从表名猜前缀。
+    pub schema: Option<&'static str>,
     /// 相对 `data/` 的文件路径（阶段 4 起由 `COPY TO STDOUT` 取代）。
     pub file: &'static str,
     pub kind: Kind,

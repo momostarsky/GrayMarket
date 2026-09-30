@@ -20,7 +20,7 @@ use crate::engine::{Engine, PlaceRequest};
 use crate::journal::Journal;
 use crate::mem::Snapshot;
 use crate::net::{Client, Hub, NetError, serve};
-use crate::pubsub::{CatchUp, Frame, Op, RowChange, Subscribe};
+use crate::pubsub::{CatchUp, Frame, Op, RowChange, Subscribe, Topic};
 use crate::tables::{ColumnName, DataTable, composite_key_str};
 use crate::wire::WireFrame;
 
@@ -52,6 +52,8 @@ fn main() {
         .build()
         .expect("tokio runtime 起不来");
     runtime.block_on(demo_send_side(&data_root));
+    // 阶段 3.5 的主题粒度：一条通配过真 socket，命不中的那一档当场被拒。
+    runtime.block_on(demo_topics(&data_root));
 }
 
 /// 加载：三种粒度按需选。
@@ -578,10 +580,10 @@ fn demo_protocol(root: &Path) {
             "要快照就必须订 Upsert",
         ),
     ] {
-        let tables = spec.tables.join(",");
+        let topics = spec.topics.join(",");
         match engine.subscribe(spec) {
-            Ok(_) => panic!("{tables} 这条请求本应被拒（{expect}）"),
-            Err(error) => println!("  拒订 {tables}：{error}（{expect}）"),
+            Ok(_) => panic!("{topics} 这条请求本应被拒（{expect}）"),
+            Err(error) => println!("  拒订 {topics}：{error}（{expect}）"),
         }
     }
 
@@ -826,6 +828,71 @@ async fn demo_send_side(root: &Path) {
     );
     assert_eq!(engine.durable(), engine.seq(), "到最后落盘应追平受理");
     assert_matches_kernel(quick.mirror(), &kernel_mirror(&engine, TABLE_LIST));
+}
+
+/// 阶段 3.5：主题粒度。一条 `table:*` 换来整份注册中心，一条 `table:{schema}.*` 在真实库
+/// 还没接表时被当场拒 —— 「命中零张」绝不留下一个看起来成功、其实永远静默的订阅。
+async fn demo_topics(root: &Path) {
+    println!("\n[12] 主题粒度：一条主题展开成一组表，命中零张当场拒订");
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("graydb-demo-topic-{}.journal.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let journal = Journal::open(&path).expect("演示 journal 打开失败");
+    let mut engine = Engine::with_ring(Snapshot::load(root).expect("重新加载一份干净镜像"), journal, 64);
+
+    // ① 展开本身：通配与精确名重叠只算一张 —— 不去重就会下两遍快照，
+    //    消费者的镜像会在第二道 begin 上撞 `DuplicateBegin`。
+    let all = Subscribe::of_topics(&["table:*"])
+        .validate()
+        .expect("全库主题应放行");
+    let overlapped = Subscribe::of_topics(&["table:*", "table:orders"])
+        .validate()
+        .expect("重叠主题应放行");
+    assert_eq!(all.len(), tables::TABLES.len(), "table:* 就是注册中心全部");
+    assert_eq!(overlapped, all, "通配与精确名重叠不该多出一张表");
+    println!("  table:* 展开成 {} 张表；再加一条 table:orders 仍是 {} 张", all.len(), overlapped.len());
+
+    // ② 命不中就说不中：今天 289 张真实表一律 `register = false`，带 schema 的一张都没有。
+    //    这一档在阶段 4 之前恒为空，而「恒为空」靠拒订说出口，不编一条通配假装命中。
+    let missed = Subscribe::of_topics(&["table:jzdb_prod.*"])
+        .validate()
+        .expect_err("真实库尚未接表，按 schema 订本该被拒");
+    println!("  table:jzdb_prod.* → {missed}");
+    // 「形状不对」与「这张表恰好没变更」是两种病，报错必须分得开。
+    let malformed = Topic::parse("orders").expect_err("裸表名不该被猜成主题");
+    println!("  裸表名 orders → {malformed}");
+
+    // ③ 一条通配过真 socket：客户端等的屏障数按展开后的表集算，而不是按主题串数。
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("回环监听起不来");
+    let addr = listener.local_addr().expect("已绑定就该有端口");
+    let (commands, mut hub) = Hub::new(8);
+    tokio::spawn(serve(listener, commands));
+    let mut client = Client::connect(addr, &Subscribe::of_topics(&["table:*"]))
+        .await
+        .expect("全库主题的请求该能写出");
+    for _ in 0..100 {
+        hub.drain_commands(&engine);
+        if hub.connections() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    client.finish_snapshot().await.expect("全库快照该读完");
+    assert_matches_kernel(client.mirror(), &kernel_mirror(&engine, &all));
+    println!("  一条主题的连接收到 {} 帧，镜像：{}", client.frames(), client.mirror().summary());
+
+    // ④ 增量口径不因通配而变：同一个水位、同一批行。
+    place_one(&mut engine, "O-TOPIC-1");
+    let round = hub.fan_out(&engine);
+    client.advance_to(engine.durable()).await.expect("增量该读到");
+    assert_matches_kernel(client.mirror(), &kernel_mirror(&engine, &all));
+    println!(
+        "  下一单后：本轮扇出 {} 帧，镜像 {}（水位 {}）",
+        round.frames,
+        client.mirror().summary(),
+        engine.durable()
+    );
 }
 
 /// 内核当前镜像（只取本订阅者订的那几张表）：走 `Snapshot::rows_json` 的分派臂。

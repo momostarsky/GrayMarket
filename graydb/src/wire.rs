@@ -896,13 +896,13 @@ mod tests {
     #[test]
     fn a_request_coming_off_the_wire_keeps_its_rejections() {
         // 入站请求直接解成 Subscribe：校验必须在 attach 之前跑完，网络侧不能有什么特权。
-        let spec: Subscribe = serde_json::from_str(r#"{"tables":["position"]}"#).expect("省略字段该走默认");
+        let spec: Subscribe = serde_json::from_str(r#"{"topics":["table:position"]}"#).expect("省略字段该走默认");
         assert_eq!(spec.ops, vec![Op::Upsert, Op::Delete], "省略 ops = 两种都要");
         assert!(spec.columns.is_all() && matches!(spec.filter, crate::pubsub::Filter::None));
 
         // 拼错字段名要当场报错：静悄悄按默认跑，等于把一个过滤条件丢掉。
-        let typo = r#"{"tabels":["position"]}"#;
+        let typo = r#"{"topisc":["table:position"]}"#;
         let err = serde_json::from_str::<Subscribe>(typo).expect_err("未知字段必须拒");
-        assert!(err.to_string().contains("tabels"), "报错要点名写错的字段：{err}");
+        assert!(err.to_string().contains("topisc"), "报错要点名写错的字段：{err}");
     }
 }

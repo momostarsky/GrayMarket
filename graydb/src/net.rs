@@ -493,7 +493,15 @@ impl Client {
         writer.write_all(b"\n").await.map_err(|err| NetError::Io(err.to_string()))?;
         writer.flush().await.map_err(|err| NetError::Io(err.to_string()))?;
         let tables = match spec.snapshot {
-            crate::pubsub::SnapshotMode::Full => spec.tables.len(),
+            // 屏障数按**展开后的表集**算，不按主题串数：`table:*` 一条就代表若干张表。
+            crate::pubsub::SnapshotMode::Full => {
+                match crate::pubsub::expand_topics(&spec.topics, crate::tables::TABLES) {
+                    Ok(tables) => tables.len(),
+                    // 展开不开只有一种情况：这条请求本身会被服务端拒。那就一路读到那句拒因为止 ——
+                    // 客户端有权把一个会被拒的请求真发出去，不在这里抢跑判定（拒订通道靠这条路才能被验到）。
+                    Err(_) => usize::MAX,
+                }
+            }
             crate::pubsub::SnapshotMode::DeltaOnly => 0,
         };
         Ok(Client {
@@ -871,6 +879,40 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains(r#""changes":[]"#), "空批也得看得见：{}", lines[0]);
         assert_eq!(hub.cursor_of(launch.id), Some(eng.durable()), "游标该跟上水位");
+    }
+
+    /// 3.5：一条 `table:*` 过真 socket。客户端按展开后的表数等屏障，服务端按同一份展开下发 ——
+    /// 两端各自算却拿到同一张表集，顺便把 `Client::connect` 里的展开口径也验到。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wildcard_topic_over_a_real_connection_delivers_every_table() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 失败");
+        let addr = listener.local_addr().expect("该拿到端口");
+        let (commands, mut hub) = Hub::new(DEFAULT_QUEUE_BATCHES);
+        tokio::spawn(serve(listener, commands.clone()));
+
+        let mut eng = engine("loopback-star");
+        eng.place_and_fill(req("S0", "A001", "600000", Side::Buy, 60_600, 100)).unwrap();
+        let mut client = Client::connect(addr, &Subscribe::of_topics(&["table:*"]))
+            .await
+            .expect("全库主题的连接与请求写出应成功");
+        for _ in 0..100 {
+            if hub.drain_commands(&eng) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 屏障数不等于主题串数：一条 `table:*` 背后是注册中心的全部登记表。
+        let declared: Vec<&str> = crate::tables::TABLES.iter().map(|spec| spec.id).collect();
+        client.finish_snapshot().await.expect("全库快照该读完");
+        assert!(declared.len() > 1, "这条验的是通配，单张表证不了");
+        assert_matches_kernel(client.mirror(), &eng, &declared);
+
+        // 增量口径不因通配而变：同一个水位、同一批行。
+        eng.place_and_fill(req("S1", "A001", "600000", Side::Buy, 60_600, 100)).unwrap();
+        hub.fan_out(&eng);
+        client.advance_to(eng.durable()).await.expect("增量该读到");
+        assert_matches_kernel(client.mirror(), &eng, &declared);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -479,9 +479,15 @@ fn write_specs_file(out_dir: &Path, tables: &[TableCfg]) -> Result<()> {
             Some(n) => format!("Some({n})"),
             None => "None".to_string(),
         };
+        // schema 名从 source 文件名机械剥出：`jzdb_prod_schema.sql` → `jzdb_prod`。
+        // 手写的 `schema.sql` 没有 schema 段，如实留 None —— 主题 `table:{schema}.*` 不猜前缀。
+        let schema = match cfg.source().strip_suffix("_schema.sql") {
+            Some(stem) if !stem.is_empty() => format!("Some({stem:?})"),
+            _ => "None".to_string(),
+        };
         out.push_str(&format!(
-            "    Spec {{\n        id: \"{}\",\n        file: \"{}\",\n        kind: {kind},\n        \
-             policy: {policy},\n        pk: &[{pk}],\n        fk: &[{fk}],\n        \
+            "    Spec {{\n        id: \"{}\",\n        schema: {schema},\n        file: \"{}\",\n        \
+             kind: {kind},\n        policy: {policy},\n        pk: &[{pk}],\n        fk: &[{fk}],\n        \
              expected_rows: {expected},\n    }},\n",
             cfg.id, cfg.file
         ));

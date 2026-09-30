@@ -7,6 +7,7 @@ use crate::tables::{Kind, LoadPolicy, Spec};
 pub const TABLES: &[Spec] = &[
     Spec {
         id: "user_info",
+        schema: None,
         file: "dict/user.json",
         kind: Kind::Dict,
         policy: LoadPolicy::Critical,
@@ -16,6 +17,7 @@ pub const TABLES: &[Spec] = &[
     },
     Spec {
         id: "account_info",
+        schema: None,
         file: "state/account.json",
         kind: Kind::Dict,
         policy: LoadPolicy::Critical,
@@ -25,6 +27,7 @@ pub const TABLES: &[Spec] = &[
     },
     Spec {
         id: "dict_security",
+        schema: None,
         file: "dict/security.json",
         kind: Kind::Dict,
         policy: LoadPolicy::Critical,
@@ -34,6 +37,7 @@ pub const TABLES: &[Spec] = &[
     },
     Spec {
         id: "account_asset",
+        schema: None,
         file: "state/asset.json",
         kind: Kind::State,
         policy: LoadPolicy::Critical,
@@ -43,6 +47,7 @@ pub const TABLES: &[Spec] = &[
     },
     Spec {
         id: "position",
+        schema: None,
         file: "state/position.json",
         kind: Kind::State,
         policy: LoadPolicy::Critical,
@@ -52,6 +57,7 @@ pub const TABLES: &[Spec] = &[
     },
     Spec {
         id: "orders",
+        schema: None,
         file: "state/order.json",
         kind: Kind::State,
         policy: LoadPolicy::Critical,
@@ -61,6 +67,7 @@ pub const TABLES: &[Spec] = &[
     },
     Spec {
         id: "trades",
+        schema: None,
         file: "state/trade.json",
         kind: Kind::State,
         policy: LoadPolicy::Critical,
