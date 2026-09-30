@@ -15,7 +15,7 @@ use std::time::Duration;
 use account::amount::{Money, Price, Quantity, Rounding, notional};
 use tokio::net::TcpListener;
 
-use crate::domain::{Security, Side};
+use crate::domain::{PdUnitCapitTrade, Security, Side};
 use crate::engine::{Engine, PlaceRequest};
 use crate::journal::Journal;
 use crate::mem::Snapshot;
@@ -54,6 +54,8 @@ fn main() {
     runtime.block_on(demo_send_side(&data_root));
     // 阶段 3.5 的主题粒度：一条通配过真 socket，命不中的那一档当场被拒。
     runtime.block_on(demo_topics(&data_root));
+    // 阶段 4.5 的读侧换源：同一张真实表走两条通道，落地必须逐行相等。
+    demo_read_side(&data_root);
 }
 
 /// 加载：三种粒度按需选。
@@ -62,7 +64,7 @@ fn demo_load(root: &Path) {
 
     // ① 整份镜像（生产路径）：`Snapshot::load(root)` —— 声明自检 + 逐表加载
     //    + 外键校验 + 聚合不变量，内部对每张表就是下面 ② 那一句（见 `mem.rs::load`）。
-    println!("  ① Snapshot::load → 7 张表全部就位（见上方启动报告）");
+    println!("  ① Snapshot::load → {} 张表全部就位（见上方启动报告）", tables::TABLES.len());
 
     // ② 单张表：只关心一类数据时用 `load_table::<T>()`。路径不用手写 ——
     //    由 `T::ID` 反查 `Spec::file`，校验逻辑与 ① 完全一致（不是另一套轻量版本）。
@@ -853,12 +855,17 @@ async fn demo_topics(root: &Path) {
     assert_eq!(overlapped, all, "通配与精确名重叠不该多出一张表");
     println!("  table:* 展开成 {} 张表；再加一条 table:orders 仍是 {} 张", all.len(), overlapped.len());
 
-    // ② 命不中就说不中：今天 289 张真实表一律 `register = false`，带 schema 的一张都没有。
-    //    这一档在阶段 4 之前恒为空，而「恒为空」靠拒订说出口，不编一条通配假装命中。
-    let missed = Subscribe::of_topics(&["table:jzdb_prod.*"])
+    // ② 命不中就说不中：反例用库里根本没的 schema —— 这一档必须靠拒订说出口，
+    //    不能编一条通配假装命中。正例则是 4.5 转正的那张真实表：它带 schema，
+    //    所以 `table:{schema}.*` 从「恒为空」变成了第一次真能展开。
+    let missed = Subscribe::of_topics(&["table:jzdb_nosuch.*"])
         .validate()
-        .expect_err("真实库尚未接表，按 schema 订本该被拒");
-    println!("  table:jzdb_prod.* → {missed}");
+        .expect_err("库里没这个 schema，按订本该被拒");
+    println!("  table:jzdb_nosuch.* → {missed}");
+    let by_schema = Subscribe::of_topics(&["table:jzdb_prod.*"])
+        .validate()
+        .expect("jzdb_prod 已有转正的表，这条通配不该再被拒");
+    println!("  table:jzdb_prod.* 展开成 {:?}", by_schema);
     // 「形状不对」与「这张表恰好没变更」是两种病，报错必须分得开。
     let malformed = Topic::parse("orders").expect_err("裸表名不该被猜成主题");
     println!("  裸表名 orders → {malformed}");
@@ -893,6 +900,44 @@ async fn demo_topics(root: &Path) {
         client.mirror().summary(),
         engine.durable()
     );
+}
+
+/// 阶段 4.5：读侧换源。表清单与校验口径只有一份，换源只换「行从哪来」：
+/// 文件通道拿 `{"外层键": {…行}}`，PG 通道拿 `COPY … WITH (FORMAT json, ARRAY true)` 的产物
+/// —— 一份**没有外层键**的数组。两条通道只在取行一步分叉，建行 / 分级 / 哨兵全部合流。
+fn demo_read_side(root: &Path) {
+    println!("\n[13] 读侧换源：同一张表两条通道，落地逐行相等");
+
+    let spec = tables::spec_of(PdUnitCapitTrade::ID).expect("试点表应已登记");
+    let from_file =
+        tables::load_specified_table::<PdUnitCapitTrade>(root, spec).expect("文件通道加载失败");
+    let pg_path = root.join("pg").join("tb_pdmage_pd_unit_capit_trade.pg.json");
+    let from_pg = tables::load_from_source::<PdUnitCapitTrade>(
+        spec,
+        &tables::Source::PgJsonArray { path: &pg_path },
+    )
+    .expect("PG 形状通道加载失败");
+
+    println!(
+        "  {}：schema={:?} pk={:?} policy={:?}，文件 {} 行 / PG {} 行",
+        spec.id, spec.schema, spec.pk, spec.policy, from_file.len(), from_pg.len()
+    );
+
+    let mut file_keys: Vec<&String> = from_file.rows().keys().collect();
+    let mut pg_keys: Vec<&String> = from_pg.rows().keys().collect();
+    file_keys.sort();
+    pg_keys.sort();
+    assert_eq!(file_keys, pg_keys, "行键集合必须一致 —— 现算主键不认文件顺序");
+    // 两份 fixture 的行序刻意不同（文件 1/2/3，PG 数组 1/3/2）：
+    // 逐行相等只能来自「按 `Spec::pk` 现算的行键对齐」，不来自顺序巧合。
+    for key in &file_keys {
+        let left = serde_json::to_string(from_file.get(key).expect("刚列出的键"))
+            .expect("行应可序列化");
+        let right = serde_json::to_string(from_pg.get(key).expect("刚列出的键"))
+            .expect("行应可序列化");
+        println!("  行键 {key:<3} 逐字段相等：{}（{} 字节）", left == right, left.len());
+        assert_eq!(left, right, "行键 {key} 换源后不该有一个字节不同");
+    }
 }
 
 /// 内核当前镜像（只取本订阅者订的那几张表）：走 `Snapshot::rows_json` 的分派臂。
@@ -952,7 +997,7 @@ mod mock_data_tests {
         Snapshot::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).unwrap()
     }
 
-    /// 七份 JSON → 领域结构 → 声明式校验全跑一遍。
+    /// 八份 JSON → 领域结构 → 声明式校验全跑一遍。
     ///
     /// 这里原先手写的两段外键 `for` 循环已删：语义等价地搬进了 `TABLES` 的 `fk` 声明
     /// （`account_info.user_id → user_info`、`position.symbol → dict_security` 等），
@@ -970,6 +1015,8 @@ mod mock_data_tests {
         // 阶段 1 的流水表日初为空，只能由内核写入（与 `tables.toml` 的 `expected_rows = 0` 同源）
         assert_eq!(snap.orders.len(), 0);
         assert_eq!(snap.trades.len(), 0);
+        // 阶段 4.5 转正的首张真实表：同一份 `data/` 目录，同一条加载链。
+        assert_eq!(snap.pd_unit_capit_trades.len(), 3);
 
         snap.check_integrity().unwrap();
 

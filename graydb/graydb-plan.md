@@ -1,6 +1,6 @@
 # GrayDB 推进计划
 
-> 最后更新：2026-09-30　|　分支：main　|　状态：**阶段 3.1/3.2/3.3/3.4/3.6 完成（订阅协议 `Subscribe`/`Frame` + 全量快照下发 + 发送侧编解码边界与 per-connection 背压隔离：真 socket 上跑通，而内核线程一次 `await` 都没有）；阶段 2 的 mmap 段文件与 group commit 仍推迟；下一步：阶段 3.5 主题粒度 / 帧换紧凑字节流（吞吐），或 stub 逐表转正**
+> 最后更新：2026-09-30　|　分支：main　|　状态：**阶段 4.5 读侧换源（抽象层）完成 —— `Source::{File, PgJsonArray}` × `Rows::{Keyed, Unkeyed}` × `declared_key` 把「行从哪来」与「校验口径」彻底解耦，试点 `tb_pdmage_pd_unit_capit_trade` 转正为第 8 张登记表（首个 `schema = jzdb_prod` 的真实表），两条通道载入同一张表逐行字节相等；阶段 2 的 mmap 段文件与 group commit 仍推迟；下一步：阶段 4.1 `tokio-postgres` + `COPY`（**阻塞在可连实例**，本机实测无 PG）／或继续逐表转正（不依赖实例的那部分）**
 
 ## 一、项目定位
 
@@ -47,14 +47,16 @@ GrayMarket/
     ├── tables.toml         策略与类型映射（[[table]] 显式声明 + [[stub]] 整表搬入；source/table 指定 DDL 来源，register 控制是否进 TABLES）
     ├── data/               mock 数据（手写 JSON = 未来 PG 表的投影）
     │   ├── dict/           security.json(2), user.json(3)
-    │   └── state/          account.json(3), asset.json(3), position.json(2), order.json(0), trade.json(0)
+    │   ├── state/          account.json(3), asset.json(3), position.json(2), order.json(0), trade.json(0),
+    │   │                   tb_pdmage_pd_unit_capit_trade.json(3)  ← 阶段 4.5 首张转正的真实表（keyed 文件通道）
+    │   └── pg/             tb_pdmage_pd_unit_capit_trade.pg.json(3)  ← `COPY … WITH (FORMAT json, ARRAY true)` 的产物形状（**无外层键**的数组），PG 通道 fixture
     └── src/
-        ├── main.rs         启动入口（加载 + 启动报告 + 写路径样板 `demo_engine`（含恢复回放 `[8]`）+ 订阅出口样板 `demo_pubsub`（`[9]`）+ 订阅协议样板 `demo_protocol`（`[10]`）+ 发送侧样板 `demo_send_side`（`[11]`）+ 主题粒度样板 `demo_topics`（`[12]`，`[11]`/`[12]` 共用 `main()` 里那一个 runtime，内核仍零 `await`）+ mock_data_tests(2)）
-        ├── generated/      ← codegen 产物（签入库，勿手改）：299 文件 = 7 登记表演示 + 1 试点 + 289 stub 真实表 + specs(TABLES) + mod
-        ├── tables.rs       注册中心：Spec（3.5 起含 `schema: Option<&'static str>` 分组维度）/ DataTable(+type `Column`,:RowValidator) / ColVal / ColumnName / RowValidator / load_table / FkIndex / TableStat + 写路径契约（upsert/replace/delete）+ tests(12)
-        ├── domain/mod.rs   业务枚举 + 7 个 impl RowValidator（人写不变量，含 Order/Trade）+ pub use generated
+        ├── main.rs         启动入口（加载 + 启动报告 + 写路径样板 `demo_engine`（含恢复回放 `[8]`）+ 订阅出口样板 `demo_pubsub`（`[9]`）+ 订阅协议样板 `demo_protocol`（`[10]`）+ 发送侧样板 `demo_send_side`（`[11]`）+ 主题粒度样板 `demo_topics`（`[12]`，`[11]`/`[12]` 共用 `main()` 里那一个 runtime，内核仍零 `await`）+ 读侧换源样板 `demo_read_side`（`[13]`，阶段 4.5）+ mock_data_tests(2)）
+        ├── generated/      ← codegen 产物（签入库，勿手改）：299 文件 = 7 登记表演示 + 1 张 4.5 转正的真实表 + 289 stub 真实表 + specs(TABLES，8 条) + mod
+        ├── tables.rs       注册中心：Spec（3.5 起含 `schema: Option<&'static str>` 分组维度）/ DataTable(+type `Column`,:RowValidator) / ColVal / ColumnName / RowValidator / load_table / FkIndex / TableStat + 写路径契约（upsert/replace/delete）+ **换源接缝 `Source::{File,PgJsonArray}` × `Rows::{Keyed,Unkeyed}` × `declared_key`**（阶段 4.5，两条通道只在取行分叉）+ tests(18)
+        ├── domain/mod.rs   业务枚举 + 8 个 impl RowValidator（人写不变量，含 Order/Trade；4.5 起的真实表 `PdUnitCapitTrade` 只断 `row_id > 0`）+ pub use generated
         ├── engine.rs       单线程内核：RejectReason / KernelError / Ack / place / apply_fill / cancel / **recover + replay_record**（阶段 2）/ **note_row + publish_group**（阶段 3.1 出口挂钩）/ **subscribe + poll**（阶段 3.2 协议交付）+ tests(27)
-        ├── mem.rs          Snapshot（强类型 `Table<T>` 字段，7 表）+ 声明式校验 + 资金三原语（`Result<(), RejectReason>`）+ **读侧按表身份取行 `row_json`/`rows_json`/`columns_of`**（阶段 3.6 分派，缺臂即 panic）+ tests(5)
+        ├── mem.rs          Snapshot（强类型 `Table<T>` 字段，8 表 —— 4.5 起含只读的真实表，不进 `save` 名单）+ 声明式校验 + 资金三原语（`Result<(), RejectReason>`）+ **读侧按表身份取行 `row_json`/`rows_json`/`columns_of`**（阶段 3.6 分派，缺臂即 panic）+ tests(6)
         ├── journal.rs      WAL：`Record{term,seq,entry}` / `Entry`（表名取自 `DataTable::ID`）/ `GroupWriter`（唯一写入口）/ `commit`（flush + `sync_data`）/ `read`（回放读取 + 截断判定）+ tests(2)
         ├── pubsub.rs       订阅出口与协议（阶段 3.1/3.2/3.3/3.5/3.6）：`Op` / `RowChange` / `Note` / `Broadcast`（有界环 + 游标拉取 + 整组淘汰）/ `CatchUp` / **`Topic`+`Topic::parse`+`expand_topics`/`expand_specs`**（阶段 3.5：三档主题在 attach 一次性展开成表集，注册中心作入参的纯函数）/ `Subscribe`+`Frame`+`Subscriber`+`SubscribeError`（对外协议层）/ **`peek_batch` + `commit` 两步拆分**（阶段 3.4：先投后交）+ tests(13)
         ├── wire.rs         编解码边界（阶段 3.4，**不依赖 tokio**）：`WireFrame`/`WireRowChange`（拥有型表名 + `Deserialize`，表名经 `spec_of` 归位）/ NDJSON `encode_line`/`decode_line` + 单帧上限 / `Mirror`+`MirrorError`（消费者镜像，协议腐化即停不猜）/ 拒订控制行 + tests(14)
@@ -124,9 +126,18 @@ GrayMarket/
 | 命中零张 = 当场拒订 | 空命中的订阅在消费者眼里与「订阅成功但确实没有变更」长得一模一样，必须说出口：`EmptyTopicMatch{topic,hint}`（那个库尚未接表）与 `UnknownTable`（精确名写错）分开报错，不留一个永久静默的订阅。真 `TABLES` 今天带 schema 的表为零 → `table:{schema}.*` 恒被拒，这是如实报告而不是编一条通配假装命中 | `pubsub::expand_specs`（阶段 3.5） |
 | 展开必须去重 | `table:*` 与 `table:orders` 同时出现只算一张：不去重就会下两遍快照，消费者镜像在第二道 `SnapshotBegin` 上撞 `DuplicateBegin`。展开顺序 = 主题声明顺序、同档内 = 注册中心顺序，两端各自算却拿到同一张表集 | `pubsub::expand_specs`（阶段 3.5） |
 | 通配不得绕过逐张表的闸门 | 展开出来的每张表仍要过 3.2 那套主键 / 列名核对：`table:*` + 账户过滤的拒因与逐个写精确名**完全一致**（`a_wildcard_does_not_slip_past_the_per_table_guards` 用 `assert_eq!(wildcard, explicit)` 钉住），通配只是写法上的 shorthand，不放宽任何口径 | `Subscribe::validate`（阶段 3.5） |
-| 通配语义靠假注册中心钉住 | 真 `TABLES` 里 7 张全是 mock（`schema = None`）、289 张真实表 `register = false` 不入库 → `table:{schema}.*` 在真注册中心上恒命中零张。展开逻辑因此写成**注册中心作入参的纯函数**，测试注入三张带 schema 的假表把「只命中该 schema / 全库 == 声明顺序 / 重叠去重」钉死 —— 「等阶段 4 有真数据再验」等于永不验证；生产路径固定传 `TABLES` | `pubsub::{expand_topics, expand_specs}`（阶段 3.5） |
+| 通配语义靠假注册中心钉住 | 真 `TABLES` 里 7 张全是 mock（`schema = None`）、289 张真实表 `register = false` 不入库 → `table:{schema}.*` 在真注册中心上恒命中零张。展开逻辑因此写成**注册中心作入参的纯函数**，测试注入三张带 schema 的假表把「只命中该 schema / 全库 == 声明顺序 / 重叠去重」钉死 —— 「等阶段 4 有真数据再验」等于永不验证；生产路径固定传 `TABLES`。**4.5 兑现了第一张**：真注册中心上 `table:jzdb_prod.*` 已能展开出 1 张，「空命中」反例随之换成 `table:jzdb_nosuch.*`（拿一个不存在的 schema 才是真的零命中） | `pubsub::{expand_topics, expand_specs}`（阶段 3.5，反例改名于 4.5） |
 | 入站字段 `tables` 改名 `topics` | 请求表达的是**意图**（一组主题），展开结果才是表；同名异构最容易被读成「客户端已经给了表」。`Subscriber::tables()` 仍返回具体表；`Subscribe::new(&[…])` 按 `Spec::id` 包前缀，`of_topics(&[…])` 原样收下（通配与反序列化走这条） | `pubsub::Subscribe` + `wire.rs`（阶段 3.5） |
 | 客户端屏障数按展开后的表集算 | `Client::connect` 等 `SnapshotEnd` 的道数 = 展开后的表数而不是主题串数（`table:*` 一条就代表若干张）。展开不开只有一种情况：这条请求本身会被服务端拒 → 客户端一路读到那句拒因为止（屏障数给 `usize::MAX`），**不在这里抢跑判定**：否则「越界请求真发出去并被服务端拒」这条通道就无法被端到端验证 | `net::Client::connect`（阶段 3.5） |
+| 数据源是 enum，不是 trait 对象 | `Source::{File{root}, PgJsonArray{path}}`：与阶段 0.5「表清单是代码」同口径 —— 可 grep、可穷举、新增一源必须改这个 enum 让所有分派臂被迫补齐。带泛型方法的 trait 不对象安全，硬上 `dyn` 就得把行擦成 `serde_json::Value` 二次解析（丢强类型 + 多一次解析） | `tables::Source`（阶段 4.5） |
+| 「外层键从哪来」必须在类型上显式 | `Rows::{Keyed(Vec<(String,T)>), Unkeyed(Vec<T>)}`：文件通道的键是人写的，PG 根本不认我们的键。不分开建模，就只能拿「外层键 == 拼键」这一句断言去同时管两件事，PG 通道会直接把它退化掉（防线静默消失） | `tables::Rows`（阶段 4.5） |
+| 两条通道的撞键防线不是一句话 | `Keyed`：外层键必须 == 现算主键（0.5 那条原样保留）；`Unkeyed`：无键可比，换成「两行算出同一主键即拒」（`map.insert(..).is_none()`）。合流点只有一个：`table_from_rows`，校验口径在此只写一遍 | `tables::table_from_rows`（阶段 4.5） |
+| 行键拼法全库一份 | `declared_key(spec, row)` 由 `verify_primary_keys` 与 `write_row` 里那两段重复拼键合并而来：加载期与内核写入期调的是同一个函数 —— 同一个身份写两套算式，早晚会在某一套里算错 | `tables::declared_key`（阶段 4.5） |
+| 首张转正的真实表选试点 `tb_pdmage_pd_unit_capit_trade` | 它不在外键关系里（`fk = []`）、也不进内核写路径，45 列 + 单主键 `row_id` 正好把「PG 表的主键口径与 mock 的业务复合键不同」这个缺口顶出来；`register` 改 true 即自动从 stub 转正（0.9 设计兑现） | `tables.toml`（阶段 4.5） |
+| 转正即 `policy = Critical` | 原为 `Lazy`（stub 不加载）。这一刀要验的就是「该通道必须真读到行」，降级成空表会把结论静默掉；`Optional`/`Lazy` 的分级语义早有 `tables.rs` 两条策略测试守着，不靠这张表重复证 | `tables.toml`（阶段 4.5） |
+| 真实表的 `RowValidator` 宁少不假 | 只断 `row_id > 0`（DDL 的 `IDENTITY (START WITH 1)` + `NOT NULL` 推得出）；金额一律不设非负守卫（退佣/清算轧差可为负），也不从列名猜 `all_fee == 各费之和`、`update_times >= 0` 这类规则 —— 写权在 PG，猜错一条就启动即拒载一张好端端的真表，比不校验更糟 | `domain/mod.rs`（阶段 4.5） |
+| `Snapshot::save` 不回写真实表 | 只回写 `Kind::State` 且**内核会写**的四张表。转正的 `tb_pdmage_pd_unit_capit_trade` 故意不在名单里：拿内存里那份去覆写文件，等于造出一个两边都不认账的副本 | `mem::Snapshot::save`（阶段 4.5） |
+| 无可连实例就不引 PG 客户端 | 用户裁决「暂无实例，先做抽象层」：本阶段不加 `tokio-postgres`（写了就是一段从未跑过的 SQL）。改用 `COPY … WITH (FORMAT json, ARRAY true)` 的**真实产物形状**做 fixture 把通道语义钉住，4.1 只把「读这个文件」换成「执行这条 `COPY`」 | `tables::Source::PgJsonArray`（阶段 4.5） |
 
 ### Mock 数据的自洽不变量（已有测试守护）
 
@@ -147,8 +158,11 @@ replay(日初镜像 + journal) == 崩溃前内存（逐分不差）      ← `En
 journal 可采信的三个条件：表名已登记 / 行内 seq == 信封 seq / 组间 seq 稠密 ← `Journal::read`
 资金/市值 非负                                        ← `impl RowValidator for Asset`
 lot_size > 0 && price_tick > 0                       ← `impl RowValidator for Security`
-JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机械校验（`pk_parts` 已删）
-每张表行数 == `Spec::expected_rows`                   ← mock 阶段数据回归哨兵（接 PG 后置 None）
+JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← 仅文件通道（`Rows::Keyed`）；拼键函数 `declared_key` 与内核 `write_row` 共用
+PG 通道不许两行算出同一主键                      ← `Rows::Unkeyed` + `table_from_rows` 的 `insert(..).is_none()`（阶段 4.5）
+两条通道载入同一张表 → 逐行 JSON 相等              ← `file_and_pg_channels_land_the_same_rows` + `[13]` 演示（阶段 4.5）
+真实表 row_id > 0（DDL `IDENTITY START WITH 1`）   ← `impl RowValidator for PdUnitCapitTrade`，只断这一条（阶段 4.5）
+每张表行数 == `Spec::expected_rows`                   ← 数据回归哨兵，**不认数据源**（PG 通道同样受约束）；换成 PG `count(*)` 属 4.2
 发布集合 == 前后镜像的真实行差异（含 delete）        ← `note_row`/`publish_group` + `changed_rows` 守护测试（阶段 3.1）
 静置时「已发布组序号 == 已落盘序号」                    ← `Broadcast::published` == `Engine::durable`（阶段 3.1）
 消费者落后只表现为 `Lagged`，永不回压写路径              ← 有界环 + 整组淘汰（阶段 3.1/3.3）
@@ -167,14 +181,14 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 
 | 位置 | 测试 |
 |---|---|
-| `graydb/src/tables.rs` | 12 个守护测试：`table_ids_are_unique_and_match_files`、`every_declared_table_is_loaded_and_nonempty_or_marked`、`critical_table_missing_refuses_startup`、`optional_table_degrades_to_empty_and_is_marked`、`fk_violation_is_caught_from_declaration_only`、`primary_key_must_match_json_outer_key`、`composite_key_mixed_segments_render_stably`、`column_name_round_trips_and_rejects_unknown`、`int_primary_key_is_supported_end_to_end`、`generated_column_enums_cover_declared_columns`、`upsert_clears_old_index_values_on_reindex_column`（防线①）、`upsert_enforces_check_row_before_any_mutation`（防线②） |
+| `graydb/src/tables.rs` | 18 个守护测试：`table_ids_are_unique_and_match_files`、`every_declared_table_is_loaded_and_nonempty_or_marked`（4.5 起含第 8 张真实表）、`critical_table_missing_refuses_startup`、`optional_table_degrades_to_empty_and_is_marked`、`fk_violation_is_caught_from_declaration_only`、`primary_key_must_match_json_outer_key`、`composite_key_mixed_segments_render_stably`、`column_name_round_trips_and_rejects_unknown`、`int_primary_key_is_supported_end_to_end`、`generated_column_enums_cover_declared_columns`（4.5 起覆盖 `PdUnitCapitTrade` 的 45 列）、`upsert_clears_old_index_values_on_reindex_column`（防线①）、`upsert_enforces_check_row_before_any_mutation`（防线②）、**阶段 4.5 六个**：`file_and_pg_channels_land_the_same_rows`（两份 fixture 行序不同、逐行 JSON 字节相等 —— 相等的来源只能是主键对齐，不是文件顺序）、`pg_channel_refuses_rows_colliding_on_primary_key`（无外层键时的那道新防线）、`file_channel_still_checks_outer_key_against_int_primary_key`（换源后 0.5 那条口径没退化）、`missing_column_in_pg_stream_is_refused_not_defaulted`（真实表少一列即 `Err`，不默认补零）、`zero_row_id_is_refused_by_the_domain_validator`（domain 那一条校验真在加载路径上生效）、`expected_rows_sentinel_applies_to_the_pg_channel_too`（哨兵不认数据源） |
 | `graydb/src/engine.rs` | 27 个全链路测试：`buy_fill_conserves_cash_position_and_seq`、`rejection_leaves_zero_state_delta`、`duplicate_order_id_is_idempotent_not_double_frozen`、`duplicate_trade_id_is_idempotent_not_double_settled`、`partial_fill_then_cancel_settles_exactly`、`partial_sell_fill_keeps_remaining_lock`、`t_plus_one_blocks_same_day_buy_from_selling`、`sell_fill_settles_lock_and_credit`、`fill_validation_rejects_bad_price_and_overfill`、`seq_is_monotonic_and_gapless`、`journal_records_the_whole_group_under_one_seq`（读回取证信封：seq 稠密 + 表名 + 行内 seq）、`weighted_avg_price_rounds_once_at_the_end`、`replay_reconstructs_the_exact_final_state`（阶段 2.3 守护）、`replay_drops_partial_tail_and_stops_at_the_last_complete_record`（阶段 2.4）、`replay_refuses_interior_corruption_and_seq_gap`（坏日志一律拒收）、**阶段 3.1/3.3 七个**：`published_groups_match_the_real_row_diff`（发布集合 == `changed_rows` 独立算出的真实差异，含清仓 `delete`）、`each_subscriber_pulls_its_own_contiguous_slice`（游标各自连续、跟平时空 Delta）、`a_lagging_subscriber_is_dropped_without_touching_the_write_path`（小环降级不碰写路径）、`replay_rebuilds_state_without_publishing`、`row_json_dispatches_every_mutable_table`、`unregistered_table_panics_instead_of_being_dropped`、`unpublished_changes_stop_the_next_group`、**阶段 3.2/3.6 四个**：`replaying_frames_rebuilds_the_kernel_mirror`（只靠帧重建的消费者镜像每步都等于内核镜像，含清仓 `Delete`；快照行 `seq == 水位`、增量行 `seq > 水位`）、`account_filter_and_projection_apply_to_snapshot_and_delta_alike`（过滤与裁列在快照/增量同一口径，裁列必留主键，空批也推水位）、`ops_filter_drops_what_the_subscriber_did_not_ask_for`、`a_lagging_subscriber_gets_rebuild_required_and_keeps_its_cursor`（重建信号不推游标，重新 attach 后镜像与内核一致）、**阶段 3.5 一个**：`a_wildcard_snapshot_covers_exactly_the_tables_expanded_at_attach`（`table:*` 的屏障道数 == attach 时展开的表数，一道不多（重复 begin 会被消费者判协议畸形）一道不少（少一道就是静默少一张表）） |
 | `graydb/src/journal.rs` | `table_tag_matches_registry_identity`（serde 外部标签 == `DataTable::ID` == `Spec::id`）、`record_round_trips_with_envelope`（`{term,seq,entry}` 写读往返） |
-| `graydb/src/pubsub.rs` | 13 个：`unknown_table_is_refused_at_the_boundary`（未登记表在出口边界即拒）、`row_change_serializes_with_registry_identity`（帧里表名 == `Spec::id`）、`eviction_never_splits_a_group`（整组淘汰 + `dropped_rows` 计数）、`lagging_cursor_degrades_instead_of_returning_a_hole`（跌出窗口判 `Lagged`，不给缺段 Delta）、`bad_subscribe_requests_are_refused_at_attach`（空主题/空 ops/只订 Delete 却要快照/未知表/未知列逐个结构化拒订）、`account_filter_is_open_exactly_where_the_key_supports_it`、`account_ownership_comes_from_the_key_not_the_row`、`projection_always_keeps_the_primary_key`、`frames_use_snake_case_external_tags`、**阶段 3.5 四个**：`topics_expand_to_table_sets_in_registry_order`（假注册中心里三档各自展开成什么 + 重叠去重）、`a_topic_matching_nothing_is_refused_rather_than_silently_empty`（空命中与拼错表名分别报错，真 `TABLES` 上 `table:jzdb_prod.*` 也恒被拒）、`every_ambiguous_topic_shape_is_rejected_at_parse`（7 个歧义形状表驱动 + 合法三档的解析结果钉住，免得日后有人「顺手放宽」）、`a_wildcard_does_not_slip_past_the_per_table_guards`（通配的拒因与逐个精确名完全一致） |
+| `graydb/src/pubsub.rs` | 13 个：`unknown_table_is_refused_at_the_boundary`（未登记表在出口边界即拒）、`row_change_serializes_with_registry_identity`（帧里表名 == `Spec::id`）、`eviction_never_splits_a_group`（整组淘汰 + `dropped_rows` 计数）、`lagging_cursor_degrades_instead_of_returning_a_hole`（跌出窗口判 `Lagged`，不给缺段 Delta）、`bad_subscribe_requests_are_refused_at_attach`（空主题/空 ops/只订 Delete 却要快照/未知表/未知列逐个结构化拒订）、`account_filter_is_open_exactly_where_the_key_supports_it`、`account_ownership_comes_from_the_key_not_the_row`、`projection_always_keeps_the_primary_key`、`frames_use_snake_case_external_tags`、**阶段 3.5 四个**：`topics_expand_to_table_sets_in_registry_order`（假注册中心里三档各自展开成什么 + 重叠去重）、`a_topic_matching_nothing_is_refused_rather_than_silently_empty`（空命中与拼错表名分别报错；4.5 后真 `TABLES` 上 `table:jzdb_prod.*` 已能展开成 1 张，故反例改用 `table:jzdb_nosuch.*`，并同时正向钉住 `jzdb_prod` 可展开）、`every_ambiguous_topic_shape_is_rejected_at_parse`（7 个歧义形状表驱动 + 合法三档的解析结果钉住，免得日后有人「顺手放宽」）、`a_wildcard_does_not_slip_past_the_per_table_guards`（通配的拒因与逐个精确名完全一致） |
 | `graydb/src/wire.rs` | 14 个（阶段 3.4 编解码边界）：`a_round_trip_through_the_wire_returns_the_same_frame`（编码 → 解码 → 归位逐帧无损）、`frames_use_snake_case_external_tags`（钉死线上字面量）、`one_frame_is_exactly_one_line_even_when_a_key_holds_a_newline`、`unknown_fields_survive_but_missing_ones_do_not`（出站前向兼容）、`blank_and_oversized_lines_are_refused_before_parsing`（分配之前即拒）、`an_unregistered_table_name_is_refused_at_reassembly`、`a_mirror_rebuilds_rows_and_watermark_from_frames`、`rebuild_required_blocks_further_deltas_until_a_new_snapshot`、`the_mirror_stops_on_protocol_corruption_instead_of_guessing`（9 例畸形帧表驱动）、`a_rejected_batch_leaves_not_even_part_of_it_applied`（整批先验后写）、`a_truncated_snapshot_is_visible_instead_of_looking_complete`、`an_empty_delete_is_idempotent_rather_than_an_error`、`a_request_coming_off_the_wire_keeps_its_rejections`（入站 `deny_unknown_fields`）、`a_rejection_travels_on_the_wire_as_a_readable_reason` |
 | `graydb/src/net.rs` | 9 个（阶段 3.4 发送侧 + 3.5 通配端到端）：`fan_out_commits_the_cursor_only_after_the_batch_is_accepted`（本阶段命门：投出去才能提交）、`a_stalled_connection_costs_the_kernel_nothing`（铁律 5 正面断言）、`a_smaller_queue_hurts_only_the_connection_that_has_it`（容量是服务端策略且只坑自己 + `cursors()` 可直接读出退让与降级）、`a_lagging_connection_is_told_to_rebuild_and_then_left_alone`（降级送达才算送达，之后不再收增量）、`a_dead_writer_is_detached_on_the_next_fan_out`（`try_reserve` 探活）、`an_out_of_scope_request_is_refused_over_the_channel_with_its_reason`、`an_idle_round_says_nothing_but_a_watermark_round_says_the_watermark`、`a_real_loopback_connection_rebuilds_the_kernel_state`（真 socket 端到端：快照 → 增量 → 拒订回话）、`a_wildcard_topic_over_a_real_connection_delivers_every_table`（一条 `table:*` 过真 socket：客户端按展开后的表数等屏障，两端各自算却拿到同一张表集） |
-| `graydb/src/mem.rs` | `loads_all_mock_json_into_memory`（7 表，orders/trades 日初为空）、`tradability_respects_account_and_dict`、`freeze_conserves_available_plus_frozen`（含 `checked_sub` 允许负值的拦截）、`composite_key_is_stable_and_matches_json_layout`、`read_side_dispatch_covers_every_registered_table`（遍历 `TABLES` 核对三个分派臂齐全 + 行数 + 键序 + 列清单） |
-| `graydb/src/main.rs` | `all_mock_json_files_match_domain_structs`（改用 `Snapshot::load`）、`asset_invariants_hold`（测试自行复算市值，不复用生产实现） |
+| `graydb/src/mem.rs` | 6 个：`loads_all_mock_json_into_memory`（8 表，orders/trades 日初为空，4.5 起真实表 3 行）、`pilot_real_table_lands_in_the_mirror_and_is_readable`（转正链路的端到端：`degraded_tables` 不误报 + 三张读侧分派臂都命中新表 + 45 列齐全 + 单主键不拼出复合键）、`tradability_respects_account_and_dict`、`freeze_conserves_available_plus_frozen`（含 `checked_sub` 允许负值的拦截）、`composite_key_is_stable_and_matches_json_layout`、`read_side_dispatch_covers_every_registered_table`（遍历 `TABLES` 核对三个分派臂齐全 + 行数 + 键序 + 列清单） |
+| `graydb/src/main.rs` | 2 个（`mock_data_tests`）：`all_mock_json_files_match_domain_structs`（改用 `Snapshot::load`，8 份数据文件全覆盖）、`asset_invariants_hold`（测试自行复算市值，不复用生产实现） |
 | `account/src/amount.rs` | 32 个：标度显示 / 边界 / widen-narrow / 5 种舍入 / Decimal 互转 / notional / 三段式落账 / settle 错误 / 序列化格式 / 越界拒绝 / 枚举 snake_case |
 | `codegen/src/main.rs` | 4 个：`parses_real_pg_dump`（jzdb_prod 45 表全解析 + 多词类型/引号列名/内联约束）、`parses_demo_schema`、`stub_expansion_rules_hold`（全名 Pascal 不撞车 + 无 row_id 报错）、`snake_case_handles_acronyms` |
 
@@ -375,15 +389,29 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 - **守护口径 = 拿独立算式当 oracle**：`step()` 每步深拷贝前后 `Snapshot`，用 `changed_rows(before, after)`（逐行 JSON 比对，含删除）算出「真实差异」，与环里该组的发布集合逐项对齐；再核对每条发布行的值 == 表里现读那一行。入口的 13 个变更点因此不需人工数一遍 —— 漏挂任何一处（含 `delete` 与走 `rows_mut()` 的原地改）直接红。
 - **两种事故靠一个守卫拦下**：`alloc_seq` 开头查 `pending` 为空 —— 入口漏挂 `publish_group`（改了内存没发布）与落盘后改内存失败（日志与内存已分叉）都会在下一次分配序号时炸掉，不会走到「默默少发一批却无人知晓」。
 - **偏离原计划**：3.1 不用 `tokio::sync::broadcast`。推送式的 channel 满 → 阻塞或丢弃，两种决策都发生在内核里，等于让订阅端的速度进写路径；改成有界环 + 游标拉取后，内核成本恒为 O(组大小) 的 append，淘汰只伤落后者自己（`a_lagging_subscriber_is_dropped_without_touching_the_write_path` 用小环跑出来）。异步 runtime 已落在 3.4：`net.rs` 用 tokio，但内核线程仍零 `await`——`Engine` 至今不需要 `Send`，也没有一把读写锁。
-- 已知边界（本阶段刻意不做）：环是**进程内**的，跨进程历史不在环里（重启后 `published=0`，一切走快照重建）；容量按行数而非字节，一条宽行的成本未计量；`columns` 是整条请求共用而非按表给（列集合不同的表要分两次订）；发送侧留下的白（`net.rs` 模块头也写着）：快照**一次性**下发未按表分批、每连接队列按**批**不按字节计、扇出轮次之间没有公平性策略、attach 生效取决于下一次 `drain_commands`；主题侧留下的白：289 张真实表仍 `register = false`，所以 `table:{schema}.*` 在真注册中心上恒被拒（展开语义已由假清单钉死，阶段 4 逐表转正后自然兑现）；`table:{schema}.{id}` 这类 schema 限定的精确名是**明确拒绝**而非静默降级（要支持得连 `Spec::id` 的身份口径一起改）；`ops`/`snapshot`/`columns` 仍是整条请求共用而不按主题给（通配只解决「哪几张表」，不解决「每张表要不同的列」。
+- 已知边界（本阶段刻意不做）：环是**进程内**的，跨进程历史不在环里（重启后 `published=0`，一切走快照重建）；容量按行数而非字节，一条宽行的成本未计量；`columns` 是整条请求共用而非按表给（列集合不同的表要分两次订）；发送侧留下的白（`net.rs` 模块头也写着）：快照**一次性**下发未按表分批、每连接队列按**批**不按字节计、扇出轮次之间没有公平性策略、attach 生效取决于下一次 `drain_commands`；主题侧留下的白：`jzdb_prod` 已由阶段 4.5 转正 1 张（`table:jzdb_prod.*` 真能展开），其余 288 张真实表仍 `register = false`（展开语义已由假清单钉死，逐表转正后自然兑现）；`table:{schema}.{id}` 这类 schema 限定的精确名是**明确拒绝**而非静默降级（要支持得连 `Spec::id` 的身份口径一起改）；`ops`/`snapshot`/`columns` 仍是整条请求共用而不按主题给（通配只解决「哪几张表」，不解决「每张表要不同的列」。
 
-### 阶段 4：接入真实 PG
+### ⏳ 阶段 4：接入真实 PG（4.5 抽象层已完成，4.1–4.4 待可连实例）
 
-- 4.1 `tokio-postgres` + `COPY`；`store` 模块此时正式成型（对齐 `Snapshot` 的加载接口）；
-- 4.2 日初加载记录 `(lsn, batch_seq)` 锚点，日终校验主数据在窗口内未被改写；锚点落在 `TableStat.lsn`（按表粒度）；
-- 4.3 逻辑复制槽（wal2json 验证 → pgoutput 定稿）单向同步主数据变更进内存；PG 表名 = `Spec::id`，订阅槽与清单自动对齐；
-- 4.4 日终归档：重放日志 → `COPY` 进 PG，顺带产出 Parquet 冷备；导出 SQL 由 `TABLES` 生成；
-- 4.5 替换数据源：`load_table::<T>()` 的文件读取换成 `COPY TO STDOUT` / 流式查询，**表清单与校验逻辑完全复用**，`data/` 退化为测试 fixture。
+目标：把「PG 是主数据的真身」这件事接进内核，同时让**表清单与校验口径始终只有一份**。
+
+| 任务 | 状态 | 说明 |
+|---|---|---|
+| 4.1 `tokio-postgres` + `COPY` | ⏳ 阻塞在实例 | 连接参数 / 超时 / `COPY … TO STDOUT WITH (FORMAT json, ARRAY true)` 落地；`store` 模块此时按 `Spec::id` 重新成型（遗留 5）。**接缝已由 4.5 做完**：那一步只是把 `Source::PgJsonArray{path}` 的一行 `std::fs::read_to_string` 换成「执行这条 `COPY` 并拿到同一形状的字节」，下游建行/分级/哨兵零改动 |
+| 4.2 日初锚点（lsn） | ⏳ | 记录 `(lsn, batch_seq)` 到 `TableStat.lsn`（按表粒度），日终校验主数据在窗口内未被改写；`expected_rows` 换 PG `count(*)` |
+| 4.3 逻辑复制槽 | ⏳ | wal2json 验证 → pgoutput 定稿，单向同步主数据变更进内存；PG 表名 = `Spec::id`，订阅槽与清单自动对齐 |
+| 4.4 日终归档 | ⏳ | 重放日志 → `COPY` 进 PG，顺带产出 Parquet 冷备；导出 SQL 由 `TABLES` 生成 |
+| 4.5 读侧换源 | ✅ | 替换数据源：`load_table::<T>()` 不再直读文件，统一走 `load_from_source(spec, &Source)`；`Rows::{Keyed,Unkeyed}` 在类型上区分「外层键从哪来」；`declared_key` 合并加载期与内核写入期的两段拼键；试点 `tb_pdmage_pd_unit_capit_trade` 转正为第 8 张登记表（首个 `schema = Some("jzdb_prod")`）；`data/` 开始向测试 fixture 退化 |
+
+**4.5 验收结果**（2026-09-30）：
+
+- `cargo test --workspace` **127 passed**（account 32 + graydb 91 + codegen 4），其中 graydb 84 → 91：`tables.rs` 12 → 18（+6 个三通道测试）、`mem.rs` 5 → 6（+1 个端到端镜像测试）；`cargo clippy --workspace --all-targets -- -D warnings` **零警告**；`cargo codegen` 重跑除 `specs.rs` 多第 8 条（及试点 `register` 转正带来的行位移）外零漂移；
+- **命门证明（换源不改数据）**：`data/state/tb_pdmage_pd_unit_capit_trade.json`（keyed，外层键 "1"/"2"/"3"）与 `data/pg/tb_pdmage_pd_unit_capit_trade.pg.json`（**无外层键的数组**，行序打乱为 1→3→2）是同一 3 行 × 45 列，`[13]` 逐行 `serde_json::to_string` 比对字节相等（1202 / 1209 / 1220 字节），另用 PowerShell 将两份反序列化后逐字段交叉核对得 diffs=0（行序不同→相等的来源只能是主键对齐）；
+- **三道拒绝都是实测不是声称**：PG 通道两行算出同一主键→ 拒（报「同一主键」）；文件通道外层键 `9999` vs `row_id=1`→ 拒（报「复合主键」，0.5 那条口径没因换源而退化）；PG 流里删掉 `row_id`→ 拒（报错指到列名，不默认补零）；`row_id = 0` → 被 `domain` 的 `RowValidator` 拒（报 `IDENTITY`）；只喂 1 行走真 spec → 行数哨兵拒（`!= 期望 3`）；
+- **转正一张 stub 表的完整链路跑通**（0.9 「写同表 `[[table]]` 自动让位」的设计首次兑现）：`tables.toml` `register=true` → codegen 不再写空 `impl RowValidator`（不变量归 domain）+ `specs.rs` 进 TABLES → `Snapshot` 加字段 + `load`/`degraded_tables`/`fk_index` + 3.6 三张读侧分派臂 → domain 手写 `impl RowValidator` → 数据文件行数对齐 `expected_rows`；`[12]` 因此从「7 张表 / 27 帧」变「8 张表 / 32 帧 = 16 屏障 + 16 行」，`table:jzdb_prod.*` 从「恒被拒」变「展开成 1 张」；`[11]` 发送侧数值与 3.4/3.5 记录逐值相等（未回归）；
+- **抽掉的两处重复**：`verify_primary_keys` 并入 `table_from_rows`（校验口径从此只写一遍）；`Spec::pk` 逐列拼键从「加载期 + 内核写入期」两份手写合并为 `declared_key`；
+- 已知边界（本阶段留下的白，都是实测确认而非推测）：文件通道里重复的外层键在 `HashMap` 反序列化那一步就被 serde 静默后写覆盖，本层看不见（要拦得自定义 visitor 或换 `IndexMap`）；数据文件多写未知列被忽略（未加 `deny_unknown_fields`），但**少写列必报错**（全列 `NOT NULL` + serde）；`Snapshot::save` 不回写这张真实表；`expected_rows` 仍是写死的整数，拿 PG `count(*)` 替它属 4.2；LWW：同一行两次 `COPY` 重叠载入靠撞键拒绝兼容，不靠「后写赢」；
+- **为何本轮不引 `tokio-postgres`**（用户裁决「暂无实例，先做抽象层」）：本机实测无 `psql`/`docker`、`127.0.0.1:5432` 无监听、无 PostgreSQL 服务 —— 写了就是一段从未跑过的 SQL，拿它做的任何「验收」都是 fixture 跟 fixture 比。
 
 ### 阶段 5：高可用
 
@@ -405,8 +433,8 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 ```powershell
 cargo test                      # 全 workspace
 cargo test -p account           # 定点数与序列化测试
-cargo test -p graydb            # 84 个测试：tables 12 + engine 27 + pubsub 13 + wire 14 + net 9 + journal 2 + mem 5 + mock 2
-cargo test -p graydb tables::    # 只跑表清单/注册中心守护测试
+cargo test -p graydb            # 91 个测试：tables 18 + engine 27 + pubsub 13 + wire 14 + net 9 + journal 2 + mem 6 + mock 2
+cargo test -p graydb tables::    # 只跑表清单/注册中心/读侧换源守护测试
 cargo test -p graydb engine::    # 只跑内核写路径与回放恢复测试
 cargo test -p graydb journal::   # 只跑 WAL 信封 / 落盘 / 截断判定测试
 cargo test -p graydb pubsub::    # 只跑订阅出口 / 有界环淘汰 / 游标补发降级 / 订阅协议校验 / 主题展开与语法拒绝测试
@@ -414,7 +442,7 @@ cargo test -p graydb wire::      # 只跑编解码边界与消费者镜像测试
 cargo test -p graydb net::       # 只跑发送侧扇出/背压/探活摘除/真回环测试（含 tokio 任务）
 cargo clippy --workspace --all-targets
 cargo codegen                   # 改 DDL/tables.toml 后重生成 graydb/src/generated（= run -p codegen）
-cargo run -p graydb             # 加载 + 按 TABLES 打印启动报告 + `[7]` 写路径 + `[8]` 日志恢复 + `[9]` 订阅出口 + `[10]` 订阅协议 + `[11]` 发送侧 + `[12]` 主题粒度
+cargo run -p graydb             # 加载 + 按 TABLES 打印启动报告 + `[7]` 写路径 + `[8]` 日志恢复 + `[9]` 订阅出口 + `[10]` 订阅协议 + `[11]` 发送侧 + `[12]` 主题粒度 + `[13]` 读侧换源
 cargo run                       # 根 package GrayMarket
 ```
 

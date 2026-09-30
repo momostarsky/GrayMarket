@@ -440,7 +440,7 @@ where
 }
 
 /// 换源后的唯一加载链：取行（按 `Source` 分支）→ 建行（按 `Spec::pk` 现算键并校验）
-/// → 分级标记 → 行数哨兵。两条通道只在第一步分叉，后面三步完合流。
+/// → 分级标记 → 行数哨兵。两条通道只在第一步分叉，后面三步完全合流。
 pub fn load_from_source<T>(spec: &'static Spec, source: &Source<'_>) -> anyhow::Result<Table<T>>
 where
     T: DataTable + DeserializeOwned,
