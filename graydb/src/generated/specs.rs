@@ -75,4 +75,14 @@ pub const TABLES: &[Spec] = &[
         fk: &[("order_id", "orders", "order_id"), ("account_id", "account_info", "account_id"), ("symbol", "dict_security", "symbol")],
         expected_rows: Some(0),
     },
+    Spec {
+        id: "tb_pdmage_pd_unit_capit_trade",
+        schema: Some("jzdb_prod"),
+        file: "state/tb_pdmage_pd_unit_capit_trade.json",
+        kind: Kind::State,
+        policy: LoadPolicy::Critical,
+        pk: &["row_id"],
+        fk: &[],
+        expected_rows: Some(3),
+    },
 ];

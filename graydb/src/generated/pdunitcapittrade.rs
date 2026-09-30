@@ -3,7 +3,6 @@
 #![allow(dead_code)]
 
 use account::amount::Money;
-use crate::tables::RowValidator;
 use crate::tables::{ColVal, ColumnName, DataTable};
 
 /// `tb_pdmage_pd_unit_capit_trade`（codegen：字段与列名源自 DDL，`PdUnitCapitTradeColumn::as_str` 与本结构体字段同源，不可能写错）。
@@ -171,5 +170,3 @@ impl DataTable for PdUnitCapitTrade {
         }
     }
 }
-
-impl RowValidator for PdUnitCapitTrade {}

@@ -124,18 +124,24 @@ amount = "Money"
 
 # 产品单元资金交易表：第一张吃真实 DDL 的试点。所有 *_amt/*_fee/*_commis 都是金额，
 # 统一 numeric→Money —— 与 account::MemTbRowPdUnitCapitTrade 的既有裁决一致。
-# register=false：struct 已可编译，接进 Snapshot 与数据文件时改 true。
+#
+# 阶段 4.5 转正（register = true）：它不在外键关系里、也不进内核写路径，拿来当
+# 「读侧换源」的首张真实表正合适 —— 45 列、pk 单列 row_id（PG 不认我们的复合键，
+# 外层键从哪来这个缺口在这里必须定下来）。
+# policy = Critical：这一刀要验的就是「该通道必须真读到行」，降级成空表会把结论静默掉；
+# Optional / Lazy 的分级语义早有 tables.rs 两条策略测试守着，不靠这张表重复证。
 [[table]]
 id = "tb_pdmage_pd_unit_capit_trade"
 struct = "PdUnitCapitTrade"
 source = "jzdb_prod_schema.sql"
 table = "tb_pdmage_pd_unit_capit_trade"
-register = false
+register = true
 file = "state/tb_pdmage_pd_unit_capit_trade.json"
 kind = "State"
-policy = "Lazy"
+policy = "Critical"
 pk = ["row_id"]
 fk = []
+expected_rows = 3
 numeric_default = "Money"
 
 # ---------------------------------------------------------------------------

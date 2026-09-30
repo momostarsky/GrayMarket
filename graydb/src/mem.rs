@@ -5,7 +5,7 @@ use std::path::Path;
 
 use account::amount::{Money, Price, Quantity, Rounding, notional};
 
-use crate::domain::{Account, AccountStatus, Asset, Order, Position, Security, Trade, User};
+use crate::domain::{Account, AccountStatus, Asset, Order, PdUnitCapitTrade, Position, Security, Trade, User};
 use crate::engine::RejectReason;
 use crate::tables::{
     ColumnName, DataTable, FkIndex, Table, TableStat, check_registry_shape, composite_key_str,
@@ -29,6 +29,9 @@ pub struct Snapshot {
     /// 内核写路径（阶段 1.1）：委托与成交。日初为空，运行期 `upsert` 写入。
     pub orders: Table<Order>,
     pub trades: Table<Trade>,
+    /// 阶段 4.5 首张转正的真实表（jzdb_prod，45 列、单主键 `row_id`）。
+    /// graydb 对它是**只读**（写权在 PG），所以不进取 `save` 的可变表名单。
+    pub pd_unit_capit_trades: Table<PdUnitCapitTrade>,
     /// 加载时的数据源标识（将来是 `lsn`，现在是文件目录）。
     pub source: String,
 }
@@ -52,6 +55,7 @@ impl Snapshot {
             positions: load_table::<Position>(root)?,
             orders: load_table::<Order>(root)?,
             trades: load_table::<Trade>(root)?,
+            pd_unit_capit_trades: load_table::<PdUnitCapitTrade>(root)?,
             source: root.display().to_string(),
         };
         snapshot.check_integrity()?;
@@ -127,6 +131,9 @@ impl Snapshot {
         if self.trades.degraded {
             degraded.push(Trade::ID);
         }
+        if self.pd_unit_capit_trades.degraded {
+            degraded.push(PdUnitCapitTrade::ID);
+        }
         degraded
     }
 
@@ -156,6 +163,7 @@ impl Snapshot {
         index.register(&self.positions);
         index.register(&self.orders);
         index.register(&self.trades);
+        index.register(&self.pd_unit_capit_trades);
         index
     }
 
@@ -200,6 +208,7 @@ impl Snapshot {
             Position::ID => self.positions.get(key).map(encode_row),
             Order::ID => self.orders.get(key).map(encode_row),
             Trade::ID => self.trades.get(key).map(encode_row),
+            PdUnitCapitTrade::ID => self.pd_unit_capit_trades.get(key).map(encode_row),
             other => panic!("表 {other:?} 未接入读侧取行分派（row_json 缺臂）"),
         }
     }
@@ -218,6 +227,7 @@ impl Snapshot {
             Position::ID => mirror_rows(&self.positions),
             Order::ID => mirror_rows(&self.orders),
             Trade::ID => mirror_rows(&self.trades),
+            PdUnitCapitTrade::ID => mirror_rows(&self.pd_unit_capit_trades),
             other => panic!("表 {other:?} 未接入读侧取行分派（rows_json 缺臂）"),
         };
         rows.sort_by(|left, right| left.0.cmp(&right.0));
@@ -237,13 +247,16 @@ impl Snapshot {
             Position::ID => column_names::<Position>(),
             Order::ID => column_names::<Order>(),
             Trade::ID => column_names::<Trade>(),
+            PdUnitCapitTrade::ID => column_names::<PdUnitCapitTrade>(),
             other => panic!("表 {other:?} 未接入读侧取行分派（columns_of 缺臂）"),
         }
     }
 
     /// 日终 dump 回 JSON —— 与 `load` 对偶，路径同样取自 `Spec::file`。
     ///
-    /// 只回写 `Kind::State` 的四张表（资金/持仓/订单/成交）；新增可变表时在此多一行。
+    /// 只回写 `Kind::State` 且**内核会写**的四张表（资金/持仓/订单/成交）；新增可变表时在此多一行。
+    /// 阶段 4.5 转正的 `tb_pdmage_pd_unit_capit_trade` 故意不在名单里：它是从 PG 读进来的
+    /// 真实表，写权在库那边 —— 拿内存里那份去覆写文件，等于造出一个两边都不认账的副本。
     pub fn save(&self, data_root: impl AsRef<Path>) -> anyhow::Result<()> {
         let root = data_root.as_ref();
         save_table(&self.assets, root)?;

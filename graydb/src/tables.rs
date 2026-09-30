@@ -306,15 +306,7 @@ impl<T: DataTable> Table<T> {
         // 防线②：校验先于一切变更 —— 失败时 rows 与 columns 均未被触碰。
         row.check_row()?;
 
-        let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(self.spec.pk.len());
-        for column in self.spec.pk {
-            let col = self.parse_column(column)?;
-            let value = row.column(col).ok_or_else(|| {
-                anyhow::anyhow!("表 {} 缺少主键列 {column}", self.spec.id)
-            })?;
-            parts.push(value);
-        }
-        let row_key = composite_key(&parts);
+        let row_key = declared_key(self.spec, &row)?;
 
         let mut fresh: Vec<(&'static str, String)> = Vec::with_capacity(self.indexed.len());
         for column in self.indexed.iter().copied() {
@@ -416,9 +408,40 @@ where
     load_specified_table::<T>(root, spec)
 }
 
-/// 显式给定声明的底层入口：分级启动、阶段 4 的数据源替换（读文件 → `COPY TO STDOUT`）
-/// 与测试都走这里，校验逻辑完全复用。
+/// 阶段 4.5 的读侧数据源。**表清单与校验口径只有一份，换源只换「行从哪来」**。
+///
+/// 刻意用 `enum` 而不是 `dyn` trait：数据源是代码（与 `TABLES` 同口径 —— 可 grep、可穷举，
+/// 是阶段 0.5「不做运行时动态注册」的另一半），而带泛型方法的 trait 不对象安全，
+/// 硬上 `dyn` 就得把行擦成 `serde_json::Value` 再二次解析。
+pub enum Source<'s> {
+    /// 阶段 0 起现状：`root.join(spec.file)`，形状 `{"外层键": {…行}}`，外层键由人写。
+    File { root: &'s Path },
+    /// PG 通道的形状：`COPY … TO STDOUT WITH (FORMAT json, ARRAY true)` 的产物 ——
+    /// **没有外层键**的 JSON 数组。本阶段拿同形状 fixture 把语义钉住（无可连实例就不写
+    /// 从未跑过的 SQL），阶段 4.1 只把「读这个文件」换成「执行这条 `COPY`」，校验一行不改。
+    PgJsonArray { path: &'s Path },
+}
+
+/// 一次取行的产物：区分「来源自带外层键」与「来源只给行」是这一刀的命门 ——
+/// 两条通道防主键撞车的手段不能是同一句断言（见 [`table_from_rows`]）。
+pub enum Rows<T> {
+    /// 文件通道：外层键是人写的，得逐行与现算主键核对。
+    Keyed(Vec<(String, T)>),
+    /// PG 通道：PG 不认我们的复合键，键只能由 `Spec::pk` 现算，防线换成「算出来不许撞」。
+    Unkeyed(Vec<T>),
+}
+
+/// 显式给定声明的底层入口（文件源）：分级启动与测试都走这里，校验逻辑完全复用。
 pub fn load_specified_table<T>(root: &Path, spec: &'static Spec) -> anyhow::Result<Table<T>>
+where
+    T: DataTable + DeserializeOwned,
+{
+    load_from_source(spec, &Source::File { root })
+}
+
+/// 换源后的唯一加载链：取行（按 `Source` 分支）→ 建行（按 `Spec::pk` 现算键并校验）
+/// → 分级标记 → 行数哨兵。两条通道只在第一步分叉，后面三步完合流。
+pub fn load_from_source<T>(spec: &'static Spec, source: &Source<'_>) -> anyhow::Result<Table<T>>
 where
     T: DataTable + DeserializeOwned,
 {
@@ -429,19 +452,81 @@ where
         T::ID
     );
 
-    let (rows, degraded) = read_rows::<T>(spec, &root.join(spec.file))?;
-    let mut table = Table {
-        spec,
-        rows,
-        indexed: Vec::new(),
-        columns: HashMap::new(),
-        degraded,
-    };
-
+    let (rows, degraded) = fetch_rows::<T>(spec, source)?;
+    let mut table = table_from_rows(spec, rows)?;
+    table.degraded = degraded;
     table.build_columns(&target_columns_of(spec.id))?;
-    verify_primary_keys(&table)?;
     verify_expected_rows(&table)?;
     Ok(table)
+}
+
+/// 行键的唯一拼法：按 `Spec::pk` 逐列 `column()` 取值 → `composite_key`。
+///
+/// 加载期（核对来源外层键 / 断现算键不撞）与内核写入期（[`Table::write_row`]）
+/// 调的是这一个函数 —— 同一个身份写两套算式，早晚会在某一套里算错。
+pub fn declared_key<T: DataTable>(spec: &Spec, row: &T) -> anyhow::Result<String> {
+    let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(spec.pk.len());
+    for column in spec.pk {
+        let col = T::Column::parse(column).ok_or_else(|| {
+            anyhow::anyhow!(
+                "表 {} 的列 {column} 未在其 Column 枚举定义（Spec 与枚举不同步）",
+                spec.id
+            )
+        })?;
+        let value = row.column(col).ok_or_else(|| {
+            anyhow::anyhow!("表 {} 缺少主键列 {column}", spec.id)
+        })?;
+        parts.push(value);
+    }
+    Ok(composite_key(&parts))
+}
+
+/// 把取回的行装成 `Table`：这是两条通道的合流点，校验口径在此只写一遍。
+///
+/// - `Keyed`（文件）：外层键必须 == 现算主键 —— 阶段 0.5 那条机械校验原样保留；
+/// - `Unkeyed`（PG）：没有外层键可比，防线换成「两行算出同一主键即拒」；
+/// - 两者都跑 `check_row`（不合法的行不配进表）。
+///
+/// 留下的白：文件通道的重复外层键在 `HashMap` 反序列化那一步就被 serde 静默后写覆盖，
+/// 本层看不见（只能靠自定义 visitor 或 `IndexMap` 才能发现）；而两行用不同外层键算出
+/// 同一主键这种撞车，两条通道都能在此拦住。
+pub fn table_from_rows<T: DataTable>(
+    spec: &'static Spec,
+    rows: Rows<T>,
+) -> anyhow::Result<Table<T>> {
+    let pairs: Vec<(Option<String>, T)> = match rows {
+        Rows::Keyed(items) => items
+            .into_iter()
+            .map(|(key, row)| (Some(key), row))
+            .collect(),
+        Rows::Unkeyed(items) => items.into_iter().map(|row| (None, row)).collect(),
+    };
+
+    let mut map: HashMap<String, T> = HashMap::with_capacity(pairs.len());
+    for (outer, row) in pairs {
+        let declared = declared_key(spec, &row)?;
+        if let Some(key) = &outer {
+            anyhow::ensure!(
+                key == &declared,
+                "表 {} 的外层键 {key} 与复合主键 {declared} 不一致",
+                spec.id
+            );
+        }
+        row.check_row()?;
+        anyhow::ensure!(
+            map.insert(declared.clone(), row).is_none(),
+            "表 {} 有两行算出同一主键 {declared}，拒绝静默后写覆盖",
+            spec.id
+        );
+    }
+
+    Ok(Table {
+        spec,
+        rows: map,
+        indexed: Vec::new(),
+        columns: HashMap::new(),
+        degraded: false,
+    })
 }
 
 /// 收集「把本表当外键目标」的所有目标列：被引用的列必须可取值，否则校验无从下手。
@@ -459,24 +544,36 @@ fn target_columns_of(table_id: &str) -> Vec<&'static str> {
     columns
 }
 
-/// 分级启动的唯一分支点：`Critical` 失败上抛，`Optional` 失败降级空表，
-/// `Lazy` 根本不去读文件（不进启动清单，而非「读取失败」）。返回值第二位 = 是否降级。
-fn read_rows<T: DeserializeOwned>(
+/// 分级启动与换源的共用分支点：`Lazy` 根本不取，取失败按策略上抛或降级空表。
+/// 返回值第二位 = 是否降级。
+fn fetch_rows<T: DeserializeOwned>(
     spec: &'static Spec,
-    path: &Path,
-) -> anyhow::Result<(HashMap<String, T>, bool)> {
+    source: &Source<'_>,
+) -> anyhow::Result<(Rows<T>, bool)> {
     if matches!(spec.policy, LoadPolicy::Lazy) {
         eprintln!("提示: 表 {} 策略 Lazy，启动期跳过加载", spec.id);
-        return Ok((HashMap::new(), false));
+        return Ok((Rows::Unkeyed(Vec::new()), false));
     }
 
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) => return degrade(spec, &format!("读取 {}", path.display()), &err),
+    let path = match source {
+        Source::File { root } => root.join(spec.file),
+        Source::PgJsonArray { path } => (*path).to_path_buf(),
     };
-    match serde_json::from_str::<HashMap<String, T>>(&raw) {
+    let action = format!("读取 {}", path.display());
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => return degrade(spec, &action, &err),
+    };
+    // 形状由源定：文件是 `{外层键: 行}`，PG 的 COPY json 是 `[行, 行]`。
+    let parsed = match source {
+        Source::File { .. } => {
+            serde_json::from_str::<HashMap<String, T>>(&raw).map(|rows| Rows::Keyed(rows.into_iter().collect()))
+        }
+        Source::PgJsonArray { .. } => serde_json::from_str::<Vec<T>>(&raw).map(Rows::Unkeyed),
+    };
+    match parsed {
         Ok(rows) => Ok((rows, false)),
-        Err(err) => degrade(spec, &format!("解析 {}", path.display()), &err),
+        Err(err) => degrade(spec, &action, &err),
     }
 }
 
@@ -484,10 +581,10 @@ fn degrade<T>(
     spec: &'static Spec,
     action: &str,
     err: &dyn std::fmt::Display,
-) -> anyhow::Result<(HashMap<String, T>, bool)> {
+) -> anyhow::Result<(Rows<T>, bool)> {
     match spec.policy {
         LoadPolicy::Critical => Err(anyhow::anyhow!(
-            "{action} 失败: {err}（表 {} 为 Critical，拒绝启动）",
+            "{action} 失败: {err}（表 {} 为 Critical，拒绍启动）",
             spec.id
         )),
         LoadPolicy::Optional => {
@@ -495,38 +592,10 @@ fn degrade<T>(
                 "警告: {action} 失败: {err}（表 {} 为 Optional，降级为空表）",
                 spec.id
             );
-            Ok((HashMap::new(), true))
+            Ok((Rows::Unkeyed(Vec::new()), true))
         }
-        LoadPolicy::Lazy => Ok((HashMap::new(), false)),
+        LoadPolicy::Lazy => Ok((Rows::Unkeyed(Vec::new()), false)),
     }
-}
-
-/// 机械校验两件事：`按 Spec::pk 逐列 column() 取值拼键` 成功，且 == `JSON 外层键`，
-/// 顺带跑一遍 `check_row`。主键列名写错、`column` 未暴露声明列在此当场失败。
-fn verify_primary_keys<T: DataTable>(table: &Table<T>) -> anyhow::Result<()> {
-    for (json_key, row) in &table.rows {
-        let mut parts: Vec<ColVal<'_>> = Vec::with_capacity(table.spec.pk.len());
-        for column in table.spec.pk {
-            let col = T::Column::parse(column).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "表 {} 的列 {column} 未在其 Column 枚举定义（Spec 与枚举不同步）",
-                    table.spec.id
-                )
-            })?;
-            let value = row.column(col).ok_or_else(|| {
-                anyhow::anyhow!("表 {} 缺少主键列 {column}", table.spec.id)
-            })?;
-            parts.push(value);
-        }
-        let declared = composite_key(&parts);
-        anyhow::ensure!(
-            json_key == &declared,
-            "表 {} 的 JSON 键 {json_key} 与复合主键 {declared} 不一致",
-            table.spec.id
-        );
-        row.check_row()?;
-    }
-    Ok(())
 }
 
 /// 行数哨兵：mock 阶段拿它当数据回归护栏，防「改数据结构却忘了改 fixture」。
