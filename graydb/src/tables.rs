@@ -566,9 +566,8 @@ fn fetch_rows<T: DeserializeOwned>(
     };
     // 形状由源定：文件是 `{外层键: 行}`，PG 的 COPY json 是 `[行, 行]`。
     let parsed = match source {
-        Source::File { .. } => {
-            serde_json::from_str::<HashMap<String, T>>(&raw).map(|rows| Rows::Keyed(rows.into_iter().collect()))
-        }
+        Source::File { .. } => serde_json::from_str::<HashMap<String, T>>(&raw)
+            .map(|rows| Rows::Keyed(rows.into_iter().collect())),
         Source::PgJsonArray { .. } => serde_json::from_str::<Vec<T>>(&raw).map(Rows::Unkeyed),
     };
     match parsed {
@@ -584,7 +583,7 @@ fn degrade<T>(
 ) -> anyhow::Result<(Rows<T>, bool)> {
     match spec.policy {
         LoadPolicy::Critical => Err(anyhow::anyhow!(
-            "{action} 失败: {err}（表 {} 为 Critical，拒绍启动）",
+            "{action} 失败: {err}（表 {} 为 Critical，拒绝启动）",
             spec.id
         )),
         LoadPolicy::Optional => {
@@ -780,7 +779,7 @@ pub fn check_registry_shape() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use account::amount::{Price, Quantity};
-    use crate::domain::{Account, Asset, Order, Position, Security, Trade, User};
+    use crate::domain::{Account, Asset, Order, PdUnitCapitTrade, Position, Security, Trade, User};
     use crate::mem::Snapshot;
 
     fn fixture_root() -> std::path::PathBuf {
@@ -820,6 +819,7 @@ mod tests {
             Position::ID,
             Order::ID,
             Trade::ID,
+            PdUnitCapitTrade::ID,
         ];
         let declared: Vec<&'static str> = TABLES.iter().map(|spec| spec.id).collect();
         for id in implemented {
@@ -1041,6 +1041,7 @@ mod tests {
         assert_covered::<Position>("position");
         assert_covered::<Order>("orders");
         assert_covered::<Trade>("trades");
+        assert_covered::<PdUnitCapitTrade>(PdUnitCapitTrade::ID);
     }
 
     /// 1.9 防线①：同一行二次写入改已索引列后，旧值不得再被 `has` 命中，
@@ -1106,5 +1107,139 @@ mod tests {
         assert!(positions.upsert(bad).is_err(), "非法行应被 check_row 拒绝");
         assert_eq!(positions.len(), before_rows, "失败不得碰行图");
         assert!(!positions.has("symbol", "999999"), "失败不得碰索引");
+    }
+
+    // ── 阶段 4.5 读侧换源：两条通道、一套校验 ─────────────────────
+
+    /// 试点表声明的临时副本：改掉文件名与行数哨兵，好让下面几个测试用一两行的临时数据。
+    fn pilot_spec(patch: impl FnOnce(&mut Spec)) -> &'static Spec {
+        let mut spec = *spec_of(PdUnitCapitTrade::ID).unwrap();
+        spec.file = "pilot.json";
+        spec.expected_rows = None;
+        patch(&mut spec);
+        Box::leak(Box::new(spec))
+    }
+
+    /// 仓内 PG 形状 fixture 的行：各测试拿它当底子改一两处，再写成临时文件。
+    fn pg_fixture_rows() -> Vec<serde_json::Value> {
+        let path = fixture_root()
+            .join("pg")
+            .join("tb_pdmage_pd_unit_capit_trade.pg.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// 把给定 JSON 当成 `COPY … FORMAT json` 的产物落到临时目录并按此加载。
+    /// 三个「该拒」的测试只差数据不同，路径与声明共用这一份。
+    fn load_pg_stream(rows: serde_json::Value) -> anyhow::Result<Table<PdUnitCapitTrade>> {
+        load_pg_stream_of(rows, pilot_spec(|_| {}))
+    }
+
+    fn load_pg_stream_of(
+        rows: serde_json::Value,
+        spec: &'static Spec,
+    ) -> anyhow::Result<Table<PdUnitCapitTrade>> {
+        let root = temp_dir("pg-stream");
+        let path = root.join("rows.pg.json");
+        std::fs::write(&path, rows.to_string()).unwrap();
+        load_from_source(spec, &Source::PgJsonArray { path: &path })
+    }
+
+    /// 4.5 的验收主语句：同一张真实表，文件通道（带外层键）与 PG 通道
+    /// （`COPY … WITH (FORMAT json, ARRAY true)` 的无外层键数组）载入后逐行相等。
+    /// 两份 fixture 的行序刻意不同（文件 1/2/3，数组 1/3/2），所以下面的相等
+    /// 只能来自「按 `Spec::pk` 现算的行键对齐」，不来自顺序巧合。
+    #[test]
+    fn file_and_pg_channels_land_the_same_rows() {
+        let spec = spec_of(PdUnitCapitTrade::ID).unwrap();
+        let pg_path = fixture_root()
+            .join("pg")
+            .join("tb_pdmage_pd_unit_capit_trade.pg.json");
+
+        let from_file = load_specified_table::<PdUnitCapitTrade>(&fixture_root(), spec).unwrap();
+        let from_pg =
+            load_from_source::<PdUnitCapitTrade>(spec, &Source::PgJsonArray { path: &pg_path }).unwrap();
+
+        let mut file_keys: Vec<&String> = from_file.rows().keys().collect();
+        let mut pg_keys: Vec<&String> = from_pg.rows().keys().collect();
+        file_keys.sort();
+        pg_keys.sort();
+        assert_eq!(file_keys, pg_keys, "两条通道算出的行键集合必须一致");
+        assert_eq!(file_keys.len(), 3);
+        for key in ["1", "2", "3"] {
+            assert!(from_pg.contains_key(key), "i64 主键应拼成十进制行键 {key}");
+        }
+        for key in &file_keys {
+            assert_eq!(
+                serde_json::to_value(from_file.get(key).unwrap()).unwrap(),
+                serde_json::to_value(from_pg.get(key).unwrap()).unwrap(),
+                "行键 {key} 在两通道落地后内容不等"
+            );
+        }
+        assert!(!from_file.degraded && !from_pg.degraded, "Critical 表不许静默降级");
+        // 真实表的金额可以是负数（退佣），domain 没编造非负守卫：这一行进得来本身就是断言。
+        assert_eq!(from_pg.get("3").unwrap().trade_commis.units(), -2500);
+    }
+
+    /// PG 通道没有外层键可比，防线换成「两行算出同一主键即拒」——
+    /// 真实场景：导出时 `join` 放大、或 `COPY` 抓到了事务中间态。
+    #[test]
+    fn pg_channel_refuses_rows_colliding_on_primary_key() {
+        let rows = pg_fixture_rows();
+        let err = load_pg_stream(serde_json::json!([rows[0].clone(), rows[0].clone()]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("同一主键"), "撞主键应被拒而非静默留一行: {err}");
+    }
+
+    /// 老防线对新的整型主键同样成立：外层键与现算主键不符即拒。
+    #[test]
+    fn file_channel_still_checks_outer_key_against_int_primary_key() {
+        let rows = pg_fixture_rows();
+        let root = temp_dir("pilot-bad-key");
+        std::fs::write(
+            root.join("pilot.json"),
+            serde_json::json!({ "9999": rows[0] }).to_string(),
+        )
+        .unwrap();
+
+        let err = load_specified_table::<PdUnitCapitTrade>(&root, pilot_spec(|_| {}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("复合主键"), "外层键 9999 与 row_id=1 不符应被拒: {err}");
+    }
+
+    /// 45 列全 `NOT NULL`：少一列就是一次失败，不许 serde 拿默认值兜过去。
+    #[test]
+    fn missing_column_in_pg_stream_is_refused_not_defaulted() {
+        let mut row = pg_fixture_rows().pop().unwrap();
+        row.as_object_mut().unwrap().remove("row_id");
+
+        let err = load_pg_stream(serde_json::json!([row])).unwrap_err().to_string();
+        assert!(err.contains("row_id"), "缺列报错应指认到列名: {err}");
+    }
+
+    /// 主键取值本身非法（`row_id = 0`）由 `domain` 的 `RowValidator` 拦下，
+    /// 且 `Critical` 不降级 —— 载入期与内核写入期共用 `check_row` 这一道闸。
+    #[test]
+    fn zero_row_id_is_refused_by_the_domain_validator() {
+        let mut row = pg_fixture_rows().pop().unwrap();
+        row["row_id"] = serde_json::json!(0);
+
+        let err = load_pg_stream(serde_json::json!([row])).unwrap_err().to_string();
+        assert!(err.contains("IDENTITY"), "应报不合法行主键: {err}");
+    }
+
+    /// 合流的证据：行数哨兵不认源 —— PG 通道行数与声明不符照样被拒，
+    /// 不因「换了个来源」就少跑一步。
+    #[test]
+    fn expected_rows_sentinel_applies_to_the_pg_channel_too() {
+        let rows = pg_fixture_rows();
+        let spec = spec_of(PdUnitCapitTrade::ID).unwrap();
+        assert_eq!(spec.expected_rows, Some(3), "试点表应带行数哨兵");
+
+        let err = load_pg_stream_of(serde_json::json!([rows[0].clone()]), spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("!= 期望 3"), "一行不够应被哨兵拦下: {err}");
     }
 }

@@ -1088,14 +1088,18 @@ mod tests {
             Err(SubscribeError::UnknownTable("pd_unit".to_string())),
             "精确名写错要指认到表"
         );
-        // 真注册中心今天一张带 schema 的表都没有：这一档在阶段 4 之前恒为空，
-        // 而「恒为空」必须由拒订表达，不能编一条通配假装命中。
         assert!(
             matches!(
-                Subscribe::of_topics(&["table:jzdb_prod.*"]).validate(),
+                Subscribe::of_topics(&["table:jzdb_nosuch.*"]).validate(),
                 Err(SubscribeError::EmptyTopicMatch { .. })
             ),
-            "真实库尚未接表时，按 schema 订就该被当场拒"
+            "库里没有的 schema 按订就该被当场拒，不能给一个永久静默的订阅"
+        );
+        // 阶段 4.5 之前这一档在真注册中心上恒为空；试点表转正后它第一次真能命中，
+        // 于是正向/反向两条各自钉住：命中的是那一张带 schema 的表，没命中的仍是假 schema。
+        assert!(
+            Subscribe::of_topics(&["table:jzdb_prod.*"]).validate().is_ok(),
+            "tb_pdmage_pd_unit_capit_trade 已带 schema=jzdb_prod 登记，这条通配不该再被拒"
         );
     }
 

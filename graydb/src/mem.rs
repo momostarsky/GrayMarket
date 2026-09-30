@@ -5,7 +5,9 @@ use std::path::Path;
 
 use account::amount::{Money, Price, Quantity, Rounding, notional};
 
-use crate::domain::{Account, AccountStatus, Asset, Order, PdUnitCapitTrade, Position, Security, Trade, User};
+use crate::domain::{
+    Account, AccountStatus, Asset, Order, PdUnitCapitTrade, Position, Security, Trade, User,
+};
 use crate::engine::RejectReason;
 use crate::tables::{
     ColumnName, DataTable, FkIndex, Table, TableStat, check_registry_shape, composite_key_str,
@@ -362,7 +364,25 @@ mod tests {
         // 阶段 1 的两张流水表：日初为空（`expected_rows = 0`），只能由内核写入。
         assert_eq!(snap.orders.len(), 0);
         assert_eq!(snap.trades.len(), 0);
+        // 阶段 4.5 转正的首张真实表：与其余 mock 表同走一条加载链。
+        assert_eq!(snap.pd_unit_capit_trades.len(), 3);
         assert!(snap.check_integrity().is_ok());
+    }
+
+    /// 4.5 转正一张表的完整链路：镜像里有字段、`degraded_tables` 不误报、
+    /// 3.6 的三张读侧分派臂都能命中新表（漏臂的后果是 `panic`，不是静默少一张）。
+    #[test]
+    fn pilot_real_table_lands_in_the_mirror_and_is_readable() {
+        let snap = snapshot();
+
+        assert!(!snap.degraded_tables().contains(&PdUnitCapitTrade::ID));
+        let row = snap.row_json(PdUnitCapitTrade::ID, "2").expect("按行键取真实表一行");
+        assert_eq!(row["pd_unit_name"], "MP-SF-002");
+        assert_eq!(snap.rows_json(PdUnitCapitTrade::ID).len(), 3, "快照下发应扫到全表");
+        // 列名事实源是 codegen 的列枚举，不是 `Spec` —— 45 列一张不少。
+        assert_eq!(Snapshot::columns_of(PdUnitCapitTrade::ID).len(), 45);
+        // 行键 = row_id 的十进制串（真实表没有我们那种业务复合键）。
+        assert!(snap.row_json(PdUnitCapitTrade::ID, "1:2").is_none(), "不该拼出复合键");
     }
 
     #[test]
