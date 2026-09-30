@@ -14,15 +14,20 @@
 //! 所以恢复（阶段 2）的口径是「按流水重建余额」：重放 order 得出应冻结额、重放 trade
 //! 得出实付/实收与持仓，而不是把 journal 里的数字往内存上抹。写失败一律 panic 而不返
 //! `Err`，正是为了让「内存已改、日志未落」这个窗口不存在。
+//!
+//! 阶段 3.1 之后，内核的终点不止 journal：每个事务组在内存变更**全部成功**后，把「这一组
+//! 真正改过的行」发布到 [`Broadcast`] 订阅出口。出口是纯内存 append，不等任何消费者。
 use std::fmt;
 use std::path::Path;
 
 use account::amount::{Amount, MicroAmount, Money, Price, Quantity, Rounding, notional};
 use rust_decimal::Decimal;
+use serde::Serialize;
 
-use crate::domain::{Order, OrderStatus, Position, Side, Trade};
+use crate::domain::{Asset, Order, OrderStatus, Position, Side, Trade};
 use crate::journal::{Entry, GroupWriter, Journal, Record};
 use crate::mem::Snapshot;
+use crate::pubsub::{Broadcast, CatchUp, DEFAULT_RING_ROWS, Note, Op, RowChange};
 use crate::tables::{composite_key_str, DataTable};
 
 /// 拒单原因。计划 1.2 的六个为主，其余是实现全链路时必然要区分的分支（宁可多列，不合并成
@@ -173,6 +178,11 @@ pub struct Recovery {
 pub struct Engine {
     pub snapshot: Snapshot,
     journal: Journal,
+    /// 3.1 订阅出口：写路径的终点，有界、无锁、不等消费者。
+    broadcast: Broadcast,
+    /// 本组已登记、尚未发布的行变更。出口在 [`Engine::publish_group`] 收尾，
+    /// 泄漏到下一组即 panic（见 [`Engine::alloc_seq`]）。
+    pending: Vec<Note>,
     /// 任期。模拟阶段恒为 0，阶段 5.3 才递增；它随每条 journal 记录落盘，
     /// 恢复时跨 term 的日志一律拒绝混放（带旧 term 的请求/日志不得进新任期）。
     term: i64,
@@ -184,9 +194,16 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(snapshot: Snapshot, journal: Journal) -> Self {
+        Self::with_ring(snapshot, journal, DEFAULT_RING_ROWS)
+    }
+
+    /// 指定补发窗口容量（行数）建内核：3.4 的慢消费者测试要用小环把淘汰跑出来。
+    pub fn with_ring(snapshot: Snapshot, journal: Journal, ring_rows: usize) -> Self {
         Self {
             snapshot,
             journal,
+            broadcast: Broadcast::new(ring_rows),
+            pending: Vec::new(),
             term: 0,
             seq: 0,
             durable: 0,
@@ -210,12 +227,34 @@ impl Engine {
         self.durable
     }
 
+    /// 订阅出口本体（只读）：消费者靠游标拉，所以内核不需要知道有几个订阅方。
+    #[must_use]
+    pub fn broadcast(&self) -> &Broadcast {
+        &self.broadcast
+    }
+
+    /// 3.3 补发入口：给出 `after_seq` 之后的全部行变更，或判定落后需重建快照。
+    /// 只读，且拷出一段有界的 Vec —— 读侧多慢都不会回压到写路径（`CatchUp` 在类型上已 `#[must_use]`）。
+    pub fn catch_up(&self, after_seq: i64) -> CatchUp {
+        self.broadcast.catch_up(after_seq)
+    }
+
     /// 1.3：每笔写恰好一个序号；上一个分配未落盘就是空洞，宁停不脏。
     fn alloc_seq(&mut self) -> i64 {
         if self.seq != self.durable {
             panic!(
                 "seq 空洞: 已分配 {} 但已落盘 {} —— 停止内核，禁止带脏继续（阶段 1.3）",
                 self.seq, self.durable
+            );
+        }
+        // 3.1 的出口守卫：上一组改了内存却没发布，变更就会混进下一组（订阅端拿到错的 seq）。
+        // 能走到这里只有两种事：入口漏挂 `publish_group`，或落盘之后动内存失败（日志与内存已分叉）。
+        // 两者都必须停内核，不允许「抹抹补补」继续跑。
+        if !self.pending.is_empty() {
+            panic!(
+                "seq {} 的组改了内存却没发布到订阅出口（pending {} 条）—— 入口漏挂 publish_group 或落盘后改内存失败，停内核（阶段 3.1）",
+                self.durable,
+                self.pending.len()
             );
         }
         let next = self
@@ -241,6 +280,59 @@ impl Engine {
             );
         }
         self.durable = seq;
+    }
+
+    /// 3.1：把一行变更登记进当前事务组。表名取自类型（`T::ID` == `Spec::id`），
+    /// 调用方不写字符串字面量 —— 与 WAL / 订阅主题 / PG 表名是同一个身份。
+    ///
+    /// 只登记键，不在这里取值：同一组里资金行会被结算改一次、再被市值重算改一次，
+    /// 登记时取到的是中间态。行内容统一由 [`Engine::publish_group`] 在组收尾时现读。
+    /// 同组重复登记合并成一条（后面的 `op` 覆盖前面的），所以「先 upsert 后 delete」
+    /// 最终只发一条 Delete，订阅端不会先收到一行再删一行。
+    fn note_row<T: DataTable>(&mut self, key: &str, op: Op) {
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|note| note.table == T::ID && note.key == key)
+        {
+            existing.op = op;
+            return;
+        }
+        self.pending.push(Note {
+            table: T::ID,
+            key: key.to_string(),
+            op,
+        });
+    }
+
+    /// 事务组的出口：内存变更全部成功后由三个入口调用。把 pending 翻译成 [`RowChange`]
+    /// （行内容仍从内存表现取 = 本组终态），盖上 `(term, seq)` 后进环。
+    fn publish_group(&mut self, seq: i64) {
+        let notes = std::mem::take(&mut self.pending);
+        if notes.is_empty() {
+            return; // 纯校验没改行（当前入口不会走到）：不推 published，也不报错
+        }
+        let mut changes = Vec::with_capacity(notes.len());
+        for note in notes {
+            let row = match note.op {
+                Op::Upsert => Some(row_json(&self.snapshot, note.table, &note.key).unwrap_or_else(|| {
+                    panic!(
+                        "出口登记的 {} 行 {} 在表里找不到 —— 登记与实际写入不一致（阶段 3.1）",
+                        note.table, note.key
+                    )
+                })),
+                Op::Delete => None,
+            };
+            changes.push(RowChange {
+                term: self.term,
+                seq,
+                table: note.table,
+                key: note.key,
+                op: note.op,
+                row,
+            });
+        }
+        self.broadcast.publish_group(changes);
     }
 
     /// 下单：全部校验通过后才冻结资金，再落 journal，最后改内存。
@@ -346,6 +438,7 @@ impl Engine {
         self.commit_journal(seq, |group| group.order(&order));
 
         self.apply_place_effect(&order)?;
+        self.publish_group(seq);
         Ok(Ack::Accepted { seq })
     }
 
@@ -369,12 +462,14 @@ impl Engine {
                     .get_mut(&key)
                     .ok_or(KernelError::Reject(RejectReason::UnknownAccount))?;
                 crate::mem::try_freeze(asset, amount)?;
+                self.note_row::<Asset>(&key, Op::Upsert);
             }
             Side::Sell => {
                 self.lock_sell_quantity(&order.account_id, &order.symbol, order.quantity)?;
             }
         }
         self.snapshot.orders.upsert(order.clone())?;
+        self.note_row::<Order>(&order.order_id, Op::Upsert);
         Ok(())
     }
 
@@ -521,8 +616,12 @@ impl Engine {
         // 成交必须写回 orders 表，并把这笔成交落进 trades 表（同一 seq 已落盘）。
         let order_id = order.order_id.clone();
         self.snapshot.orders.replace(&order_id, order)?;
+        self.note_row::<Order>(&order_id, Op::Upsert);
+        let trade_id = trade.trade_id.clone();
         self.snapshot.trades.upsert(trade)?;
+        self.note_row::<Trade>(&trade_id, Op::Upsert);
 
+        self.publish_group(seq);
         Ok(Ack::Accepted { seq })
     }
 
@@ -618,6 +717,8 @@ impl Engine {
         // 先拿主键再移入：`replace(&order.order_id, order)` 会在同一表达式里既借又移。
         let order_id = order.order_id.clone();
         self.snapshot.orders.replace(&order_id, order)?;
+        self.note_row::<Order>(&order_id, Op::Upsert);
+        self.publish_group(seq);
         Ok(Ack::Accepted { seq })
     }
 
@@ -644,6 +745,7 @@ impl Engine {
                     .get_mut(&key)
                     .ok_or(KernelError::Reject(RejectReason::UnknownAccount))?;
                 crate::mem::unfreeze(asset, residual)?;
+                self.note_row::<Asset>(&key, Op::Upsert);
             }
             Side::Sell => self.release_sell_quantity(order)?,
         }
@@ -662,6 +764,7 @@ impl Engine {
         position.available_qty = sub_or_negative(position.available_qty, quantity)
             .ok_or(KernelError::Reject(RejectReason::InsufficientPosition))?;
         self.snapshot.positions.replace(&key, position)?;
+        self.note_row::<Position>(&key, Op::Upsert);
         Ok(())
     }
 
@@ -686,6 +789,7 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("可卖数量回补溢出"))
             .map_err(KernelError::State)?;
         self.snapshot.positions.replace(&key, position)?;
+        self.note_row::<Position>(&key, Op::Upsert);
         Ok(())
     }
 
@@ -735,6 +839,7 @@ impl Engine {
                 } else {
                     self.snapshot.positions.upsert(updated)?;
                 }
+                self.note_row::<Position>(&key, Op::Upsert);
             }
             Side::Sell => {
                 let mut position = self
@@ -750,8 +855,10 @@ impl Engine {
                     // 清仓即删行：市值聚合与持仓遍历都不该再看见零行。
                     // 注意不能按 `fully_filled` 删 —— 全成但账上还剩货的情形必须保留。
                     self.snapshot.positions.delete(&key);
+                    self.note_row::<Position>(&key, Op::Delete);
                 } else {
                     self.snapshot.positions.replace(&key, position)?;
+                    self.note_row::<Position>(&key, Op::Upsert);
                 }
             }
         }
@@ -768,6 +875,7 @@ impl Engine {
             .get_mut(account_id)
             .ok_or(KernelError::Reject(RejectReason::UnknownAccount))?;
         asset.total_market_value = total;
+        self.note_row::<Asset>(account_id, Op::Upsert);
         Ok(())
     }
 
@@ -804,6 +912,10 @@ impl Engine {
         let last = log.last_seq();
         engine.seq = last;
         engine.durable = last;
+        // 回放只重建状态，不对外发布：出口只给「这个进程里真正发生过的写」用。
+        // 刚恢复的内核 ring 为空，新接上的消费者只能拿快照重建（catch_up 会判 Lagged），
+        // 而不是拿到一份跨进程混放的「历史」。
+        engine.pending.clear();
         Ok(Recovery {
             engine,
             replayed: log.records.len(),
@@ -863,6 +975,25 @@ impl Engine {
             }
         }
     }
+}
+
+/// 出口取行：把表身份（`Spec::id`）翻译成具体行的 JSON。新可变表进内核时必须在这里加一臂；
+/// 漏加的后果是发布时 `panic`（登记了却取不到行），而不是静默丢一个变更。
+/// `row_json_dispatches_every_mutable_table` 测试钉住四张表都能取到。
+fn row_json(snapshot: &Snapshot, table: &str, key: &str) -> Option<serde_json::Value> {
+    match table {
+        Asset::ID => snapshot.assets.get(key).map(encode_row),
+        Position::ID => snapshot.positions.get(key).map(encode_row),
+        Order::ID => snapshot.orders.get(key).map(encode_row),
+        Trade::ID => snapshot.trades.get(key).map(encode_row),
+        other => panic!("表 {other:?} 未接入订阅出口（row_json 缺分派臂）"),
+    }
+}
+
+/// 行→JSON 只走 serde 一条路：与 journal 落盘、快照文件同一份序列化实现，
+/// 订阅端拿到的行与日志里的行不可能不一致。
+fn encode_row<T: Serialize>(row: &T) -> serde_json::Value {
+    serde_json::to_value(row).expect("行应可序列化")
 }
 
 /// 扣减专用：`Amount::checked_sub` 只挡算术溢出，减成负数是 `Some(负值)` —— 金额层允许负
@@ -1622,5 +1753,382 @@ mod tests {
             .err()
             .expect("起点不是 seq=1 必须拒绝");
         assert!(err.to_string().contains("seq=1"), "报错要指认问题: {err}");
+    }
+
+    // ── 阶段 3.1 / 3.3：订阅出口与按游标补发 ──────────────────────
+
+    /// 内核会改的四张表。出口发布、差异算式、取行分派都以这份清单为准。
+    const MUTABLE_TABLES: [&str; 4] = [Asset::ID, Position::ID, Order::ID, Trade::ID];
+
+    /// 某张表当前的全部行 `(键, JSON)`，按键排序。取行故意在测试里另写一套，
+    /// 不与生产的 `row_json` 共用代码 —— 否则漏一张表永远测不出来。
+    fn rows_of(table: &str, snapshot: &Snapshot) -> Vec<(String, serde_json::Value)> {
+        let mut rows: Vec<(String, serde_json::Value)> = match table {
+            Asset::ID => snapshot
+                .assets
+                .rows()
+                .iter()
+                .map(|(key, row)| (key.clone(), serde_json::to_value(row).unwrap()))
+                .collect(),
+            Position::ID => snapshot
+                .positions
+                .rows()
+                .iter()
+                .map(|(key, row)| (key.clone(), serde_json::to_value(row).unwrap()))
+                .collect(),
+            Order::ID => snapshot
+                .orders
+                .rows()
+                .iter()
+                .map(|(key, row)| (key.clone(), serde_json::to_value(row).unwrap()))
+                .collect(),
+            Trade::ID => snapshot
+                .trades
+                .rows()
+                .iter()
+                .map(|(key, row)| (key.clone(), serde_json::to_value(row).unwrap()))
+                .collect(),
+            other => panic!("测试未覆盖表 {other}"),
+        };
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
+    /// 两份镜像之间的**真实**行差异（含删除）：出口该发什么，由这里独立算一遍。
+    fn changed_rows(before: &Snapshot, after: &Snapshot) -> Vec<(String, String, Op)> {
+        let mut out = Vec::new();
+        for table in MUTABLE_TABLES {
+            let old = rows_of(table, before);
+            let new = rows_of(table, after);
+            for (key, row) in &new {
+                let dirty = match old.iter().find(|(old_key, _)| old_key == key) {
+                    None => true,
+                    Some((_, old_row)) => old_row != row,
+                };
+                if dirty {
+                    out.push((table.to_string(), key.clone(), Op::Upsert));
+                }
+            }
+            for (key, _) in &old {
+                if !new.iter().any(|(new_key, _)| new_key == key) {
+                    out.push((table.to_string(), key.clone(), Op::Delete));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 环里属于 `seq` 这一组的变更集合。
+    fn published_group(engine: &Engine, seq: i64) -> Vec<(String, String, Op)> {
+        let mut rows: Vec<(String, String, Op)> = engine
+            .broadcast()
+            .retained()
+            .filter(|change| change.seq == seq)
+            .map(|change| (change.table.to_string(), change.key.clone(), change.op))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// 跑一步写路径，并把「这一步发布的组」与「前后镜像的真实差异」逐行对齐。
+    /// 这是 3.1 的守护核心：漏登记任何一个变更点（包括 `delete` 与走 `rows_mut` 的原地改）都会红。
+    ///
+    /// 游标 `cursor` 之后只有两种合法表现：窗口还罩得住就是连续 Delta（每行与表里现读一致）；
+    /// 罩不住只允许 `Lagged`，且 `oldest_seq` 必须已滑过 cursor 之后那一组 —— 绝不返回缺段的 Delta。
+    fn step(engine: &mut Engine, cursor: i64, write: impl FnOnce(&mut Engine)) -> i64 {
+        let before = engine.snapshot.clone();
+        write(engine);
+        let seq = engine.seq();
+        assert_eq!(engine.durable(), seq, "写路径必须已落盘（1.3）");
+        assert_eq!(
+            published_group(engine, seq),
+            changed_rows(&before, &engine.snapshot),
+            "seq {seq} 发布的行集合应恰好等于内存真实差异"
+        );
+        let pulled = engine.catch_up(cursor);
+        match pulled {
+            CatchUp::Delta { from, through, ref changes } => {
+                assert_eq!((from, through), (cursor + 1, seq));
+                for change in changes {
+                    let live = rows_of(change.table, &engine.snapshot)
+                        .into_iter()
+                        .find(|(key, _)| key == &change.key)
+                        .map(|(_, row)| row);
+                    match (change.op, &change.row, live) {
+                        (Op::Upsert, Some(published), Some(row)) => {
+                            assert_eq!(published, &row, "出口里的行应等于表里现读那一行")
+                        }
+                        (Op::Delete, None, None) => {}
+                        (op, published, live) => panic!(
+                            "出口记录与内存不符：op={op:?} 带行={:?} 表里有={:?}",
+                            published.is_some(),
+                            live.is_some()
+                        ),
+                    }
+                }
+            }
+            CatchUp::Lagged { oldest_seq, .. } => assert!(
+                oldest_seq.is_some_and(|oldest| oldest > cursor + 1),
+                "只有整组被淘汰出窗口才允许降级：{}",
+                engine.catch_up(cursor).summary()
+            ),
+        }
+        seq
+    }
+
+    /// 卖（含清仓 `delete`）/ 买（含新建仓位）/ 部分成交 / 撤单 每一步，发布的行集合
+    /// 都恰好等于内存差异；一笔成交把四张表的变更打在同一个 seq 上。
+    #[test]
+    fn published_groups_match_the_real_row_diff() {
+        let mut eng = engine("pub-diff");
+        let mut cursor = 0;
+
+        // 卖单下单：只锁可卖量（position）+ 订单入表，资金行不该动。
+        cursor = step(&mut eng, cursor, |e| {
+            e.place(req("OS", "A001", "09018", Side::Sell, 90_025, 800))
+                .unwrap();
+        });
+        // 全成：现金 + 市值 + 订单 + 成交，且持仓被卖空 → `delete`（最容易漏登记的一处）。
+        cursor = step(&mut eng, cursor, |e| {
+            e.apply_fill(
+                "OS-1",
+                "OS",
+                Quantity::from_units(800),
+                Price::from_units(90_025),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            published_group(&eng, cursor),
+            vec![
+                ("account_asset".to_string(), "A001".to_string(), Op::Upsert),
+                ("orders".to_string(), "OS".to_string(), Op::Upsert),
+                (
+                    "position".to_string(),
+                    composite_key_str(&["A001", "09018"]),
+                    Op::Delete
+                ),
+                ("trades".to_string(), "OS-1".to_string(), Op::Upsert),
+            ],
+            "成交应一次发出四张表的变更（1.7）"
+        );
+        // 买回：冻结资金 + 订单入表；此时仓位还不该动。
+        cursor = step(&mut eng, cursor, |e| {
+            e.place(req("OB", "A001", "09018", Side::Buy, 90_025, 300))
+                .unwrap();
+        });
+        // 部分成交：新建仓位走 `upsert`（与上面的 `replace`/`delete` 分岔全部跑过）。
+        cursor = step(&mut eng, cursor, |e| {
+            e.apply_fill(
+                "OB-1",
+                "OB",
+                Quantity::from_units(100),
+                Price::from_units(90_025),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            eng.snapshot.orders.get("OB").unwrap().status,
+            OrderStatus::PartiallyFilled
+        );
+        cursor = step(&mut eng, cursor, |e| {
+            e.apply_fill(
+                "OB-2",
+                "OB",
+                Quantity::from_units(200),
+                Price::from_units(90_025),
+            )
+            .unwrap();
+        });
+        // 撤单：解冻残额 + 订单置终态。
+        cursor = step(&mut eng, cursor, |e| {
+            e.place(req("OC", "A001", "09018", Side::Buy, 90_025, 100))
+                .unwrap();
+        });
+        cursor = step(&mut eng, cursor, |e| {
+            e.cancel("OC").unwrap();
+        });
+
+        // 幂等重放：不消耗序号、不改内存，因此也不该往出口塞一个空组。
+        let before = eng.snapshot.clone();
+        let (published_before, groups_before) = (eng.broadcast().published(), eng.broadcast().groups());
+        let ack = eng
+            .place(req("OB", "A001", "09018", Side::Buy, 90_025, 300))
+            .unwrap();
+        assert!(matches!(ack, Ack::Duplicate { .. }), "同键同内容应走幂等重放");
+        assert_eq!(eng.broadcast().published(), published_before, "重放不得发布新组");
+        assert_eq!(eng.broadcast().groups(), groups_before, "重放不得发布空组");
+        assert_eq!(changed_rows(&before, &eng.snapshot), Vec::new(), "内存一分没动");
+        assert!(eng.pending.is_empty(), "出口不该残留未发布的登记");
+        assert_eq!(cursor, eng.seq(), "序号未推，最后一步就是撤单");
+    }
+
+    /// 每个消费者一份独立游标：各自拿到自己那段连续历史，已跟上的拿到空 Delta 而不是 Lagged。
+    #[test]
+    fn each_subscriber_pulls_its_own_contiguous_slice() {
+        let mut eng = engine("pub-cursor");
+        eng.place_and_fill(req("O1", "A001", "09018", Side::Buy, 90_025, 300))
+            .unwrap();
+        eng.place(req("O2", "A001", "09018", Side::Buy, 90_025, 100))
+            .unwrap();
+        assert_eq!(eng.seq(), 3);
+
+        // 从头一次补齐：三个组依次相连，没被拆散。
+        let CatchUp::Delta { changes, through, .. } = eng.catch_up(0) else {
+            panic!("新消费者应能一次补到当前位：{}", eng.catch_up(0).summary());
+        };
+        assert_eq!(through, 3);
+        let seqs: Vec<i64> = {
+            let mut seen: Vec<i64> = Vec::new();
+            for change in &changes {
+                if seen.last() != Some(&change.seq) {
+                    seen.push(change.seq);
+                }
+            }
+            seen
+        };
+        assert_eq!(seqs, vec![1, 2, 3], "补发必须按组连续，不重不漏");
+
+        // 中途接入（游标 2）只看得到第 3 组。
+        let CatchUp::Delta { changes, from, .. } = eng.catch_up(2) else {
+            panic!("游标 2 仍在留存窗口内");
+        };
+        assert_eq!(from, 3);
+        assert!(changes.iter().all(|change| change.seq == 3));
+
+        // 已跟上的消费者：空 Delta，不是降级。
+        assert!(matches!(eng.catch_up(3), CatchUp::Delta { changes, .. } if changes.is_empty()));
+
+        // 推游标后再写一组：只拿到新增的那一组，不漏不重。
+        eng.cancel("O2").unwrap();
+        let CatchUp::Delta { changes, from, through } = eng.catch_up(3) else {
+            panic!("游标 3 应在留存窗口内");
+        };
+        assert_eq!((from, through), (4, 4));
+        assert!(changes.iter().all(|change| change.seq == 4));
+        assert!(!changes.is_empty());
+    }
+
+    /// 环小到只装得下一组时，落后的消费者被判 Lagged，而内核照常写 ——
+    /// 读侧的速度永远不会变成写侧的债（铁律 5）。
+    #[test]
+    fn a_lagging_subscriber_is_dropped_without_touching_the_write_path() {
+        let journal = Journal::open(&journal_path("pub-lag")).expect("测试 journal 打开失败");
+        let mut eng = Engine::with_ring(snapshot(), journal, 1);
+
+        for index in 0..4 {
+            let order_id = format!("OL{index}");
+            let cursor = if index == 0 { 0 } else { eng.seq() - 1 };
+            let seq = step(&mut eng, cursor, |e| {
+                e.place(req(&order_id, "A001", "09018", Side::Buy, 90_025, 100))
+                    .unwrap();
+            });
+            assert_eq!(seq, index + 1);
+        }
+
+        assert_eq!(eng.seq(), 4);
+        assert_eq!(eng.durable(), 4, "淘汰历史不影响落盘序号");
+        assert!(eng.broadcast().dropped_rows() > 0, "落后组应被计入淘汰");
+        let CatchUp::Lagged { oldest_seq, .. } = eng.catch_up(0) else {
+            panic!("游标 0 早已跌出窗口：{}", eng.catch_up(0).summary());
+        };
+        assert_eq!(oldest_seq, Some(4), "只留最新一组");
+        // 跟得上的消费者仍能拿到完整的一组变更。
+        let CatchUp::Delta { changes, .. } = eng.catch_up(3) else {
+            panic!("游标 3 仍在窗口内");
+        };
+        assert!(changes.iter().all(|change| change.seq == 4) && !changes.is_empty());
+    }
+
+    /// 回放只重建状态、不对外发布：恢复出来的内核 ring 从空开始，
+    /// 而跨进程的历史（崩溃前那两组）一律不补发 —— 拿不到比拿错安全。
+    #[test]
+    fn replay_rebuilds_state_without_publishing() {
+        let path = journal_path("pub-replay");
+        {
+            let journal = Journal::open(&path).expect("测试 journal 打开失败");
+            let mut eng = Engine::new(snapshot(), journal);
+            eng.place_and_fill(req("O1", "A001", "09018", Side::Buy, 90_025, 300))
+                .unwrap();
+            assert_eq!(eng.broadcast().published(), eng.durable(), "静置时出口与落盘齐平");
+        }
+
+        let mut recovered = Engine::recover(snapshot(), &path).expect("日初镜像 + journal 应能恢复");
+        assert_eq!(recovered.engine.seq(), 2);
+        assert!(recovered.engine.broadcast().is_empty(), "回放不得对外发布");
+        assert!(
+            recovered.engine.pending.is_empty(),
+            "回放的登记必须清空（不然下一组就被守卫生卡住）"
+        );
+        // 恢复完、还没写新单：出口是空的 —— 这个进程还没有自己的历史。
+        assert!(matches!(recovered.engine.catch_up(0), CatchUp::Delta { changes, .. } if changes.is_empty()));
+
+        // 恢复后的第一笔写：序号接得上，出口也从这一组重新开始。
+        recovered
+            .engine
+            .place(req("O2", "A001", "09018", Side::Buy, 90_025, 100))
+            .expect("恢复后的内核应能继续接单");
+        let CatchUp::Delta { changes, from, through } = recovered.engine.catch_up(2) else {
+            panic!("游标 2 就是恢复点：{}", recovered.engine.catch_up(2).summary());
+        };
+        assert_eq!((from, through), (3, 3));
+        assert!(changes.iter().all(|change| change.seq == 3));
+        // 崩溃前的 1..2 不补发：游标 0 直接判降级。
+        assert!(
+            matches!(
+                recovered.engine.catch_up(0),
+                CatchUp::Lagged { lost_through: 0, oldest_seq: Some(3) }
+            ),
+            "{}",
+            recovered.engine.catch_up(0).summary()
+        );
+    }
+
+    /// 取行分派必须覆盖四张可变表：新表进内核而忘在 `row_json` 加臂，这里先红。
+    #[test]
+    fn row_json_dispatches_every_mutable_table() {
+        let mut eng = engine("pub-rowjson");
+        eng.place_and_fill(req("O1", "A001", "09018", Side::Buy, 90_025, 300))
+            .unwrap();
+        assert_eq!(
+            MUTABLE_TABLES,
+            [Asset::ID, Position::ID, Order::ID, Trade::ID],
+            "内核可变表清单变了，取行分派与这份测试都要跟进"
+        );
+        for table in MUTABLE_TABLES {
+            let key = match table {
+                Asset::ID => "A001".to_string(),
+                Position::ID => composite_key_str(&["A001", "09018"]),
+                Order::ID => "O1".to_string(),
+                Trade::ID => "O1-1".to_string(),
+                other => panic!("内核新增可变表 {other}，测试未跟进"),
+            };
+            assert!(
+                row_json(&eng.snapshot, table, &key).is_some(),
+                "{table} 行 {key} 应能从出口取到"
+            );
+        }
+    }
+
+    /// 未接入出口的表不得静默丢变更，而是直接 panic（宁停不脏）。
+    #[test]
+    #[should_panic(expected = "未接入订阅出口")]
+    fn unregistered_table_panics_instead_of_being_dropped() {
+        let eng = engine("pub-unknown");
+        let _ = row_json(&eng.snapshot, "user_info", "U001");
+    }
+
+    /// 入口漏挂 `publish_group`（或落盘后改内存失败）时，变更不得混进下一组 —— 下一次写即 panic。
+    #[test]
+    #[should_panic(expected = "没发布到订阅出口")]
+    fn unpublished_changes_stop_the_next_group() {
+        let mut eng = engine("pub-leak");
+        eng.place(req("O1", "A001", "09018", Side::Buy, 90_025, 100))
+            .unwrap();
+        assert!(eng.pending.is_empty(), "正常出口应当已清空登记");
+        // 模拟“改了内存却忘了发布”。
+        eng.note_row::<Asset>("A001", Op::Upsert);
+        let _ = eng.place(req("O2", "A001", "09018", Side::Buy, 90_025, 100));
     }
 }

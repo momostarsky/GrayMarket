@@ -3,6 +3,7 @@ pub mod domain;
 pub mod engine;
 pub mod generated;
 pub mod mem;
+pub mod pubsub;
 pub mod tables;
 
 use std::path::Path;
@@ -13,6 +14,7 @@ use crate::domain::{Security, Side};
 use crate::engine::{Engine, PlaceRequest};
 use crate::journal::Journal;
 use crate::mem::Snapshot;
+use crate::pubsub::{CatchUp, Op};
 use crate::tables::{ColumnName, DataTable, composite_key_str};
 
 fn main() {
@@ -33,6 +35,7 @@ fn main() {
     demo_load(&data_root);
     demo_iterate(&snapshot);
     demo_engine(&data_root);
+    demo_pubsub(&data_root);
 }
 
 /// 加载：三种粒度按需选。
@@ -247,6 +250,107 @@ fn demo_engine(root: &Path) {
         .snapshot
         .check_valuation()
         .expect("回放后的市值同样该平");
+}
+
+/// 阶段 3.1 / 3.3：写路径的终点多了一个订阅出口 —— 每个事务组改了哪些行，
+/// 消费者按自己的游标来拉；拉得慢就整组淘汰，但内核照写不误（铁律 5：
+/// 读侧的速度不能变成写侧的债）。发布的值是**落账完成后的终态镜像**，不是中间态。
+fn demo_pubsub(root: &Path) {
+    println!("\n[9] 订阅出口：按组发布 + 按游标补发");
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("graydb-demo-pubsub-{}.journal.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let journal = Journal::open(&path).expect("演示 journal 打开失败");
+    let mut engine = Engine::new(Snapshot::load(root).expect("重新加载一份干净镜像"), journal);
+
+    // 卖光持仓：这一组里 `position` 行被 `delete`（不带行值），其余三张表各一条 upsert。
+    engine
+        .place_and_fill(PlaceRequest {
+            order_id: "O-PUB-S1",
+            account_id: "A001",
+            symbol: "09018",
+            side: Side::Sell,
+            price: Price::from_units(90_025),
+            quantity: Quantity::from_units(800),
+            created_at: "2026-09-29T09:30:00Z",
+        })
+        .expect("演示卖出成交不应被拒");
+    // 再走一组「下单冻结 + 撤单解冻」，看两个组各自独立。
+    engine
+        .place(PlaceRequest {
+            order_id: "O-PUB-B1",
+            account_id: "A001",
+            symbol: "600000",
+            side: Side::Buy,
+            price: Price::from_units(60_600),
+            quantity: Quantity::from_units(100),
+            created_at: "2026-09-29T09:31:00Z",
+        })
+        .expect("演示买入下单不应被拒");
+    engine.cancel("O-PUB-B1").expect("演示撤单不应失败");
+
+    println!(
+        "  内核：已落盘 seq={}，出口已发布 {} 组 / 留存 {} 行（容量 {} 行）",
+        engine.durable(),
+        engine.broadcast().groups(),
+        engine.broadcast().len(),
+        engine.broadcast().capacity()
+    );
+
+    // 消费者刚接入：游标 0，一次补到当前位。
+    let CatchUp::Delta { from, through, changes } = engine.catch_up(0) else {
+        panic!("默认大环装得下本进程全部历史，不该降级：{}", engine.catch_up(0).summary());
+    };
+    println!("  补发 {from}..{through}，{} 行：", changes.len());
+    for change in &changes {
+        println!(
+            "    seq={} {} 键={} op={:?} 带行={}",
+            change.seq, change.table, change.key, change.op, change.row.is_some()
+        );
+    }
+    assert_eq!(from, 1);
+    assert_eq!(through, engine.seq());
+    assert!(
+        changes.iter().any(|c| c.op == Op::Delete && c.row.is_none()),
+        "卖光持仓应发一条不带行值的 Delete"
+    );
+
+    // 已跟上的游标：空 Delta，而不是降级 —— 消费完不欠账。
+    assert!(
+        matches!(engine.catch_up(through), CatchUp::Delta { ref changes, .. } if changes.is_empty()),
+        "跟上当前位后应拿到空 Delta：{}", engine.catch_up(through).summary()
+    );
+
+    // 小环（只装得下一组）：慢消费者的历史被整组淘汰，写路径一分不受影响。
+    let mut tiny_path = std::env::temp_dir();
+    tiny_path.push(format!("graydb-demo-pubsub-tiny-{}.journal.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&tiny_path);
+    let tiny_journal = Journal::open(&tiny_path).expect("小环演示 journal 打开失败");
+    let mut tiny = Engine::with_ring(Snapshot::load(root).expect("重新加载日初镜像"), tiny_journal, 1);
+    for (order_id, symbol) in [("O-TINY-1", "600000"), ("O-TINY-2", "09018")] {
+        tiny
+            .place(PlaceRequest {
+                order_id,
+                account_id: "A002",
+                symbol,
+                side: Side::Buy,
+                price: Price::from_units(60_600),
+                quantity: Quantity::from_units(100),
+                created_at: "2026-09-29T09:32:00Z",
+            })
+            .expect("小环不影响受理");
+    }
+    println!(
+        "  小环（容量 1 行）：已发布 {} 组 / 留存 {} 行 / 已淘汰 {} 行，游标 0 拿到：{}",
+        tiny.broadcast().groups(),
+        tiny.broadcast().len(),
+        tiny.broadcast().dropped_rows(),
+        tiny.catch_up(0).summary()
+    );
+    assert!(matches!(tiny.catch_up(0), CatchUp::Lagged { .. }), "跌出窗口的游标必须降级");
+    assert_eq!(tiny.seq(), tiny.durable(), "淘汰历史不动落盘序号，写路径无感");
+    assert!(tiny.broadcast().dropped_rows() > 0, "慢消费者的代价只落在它自己的历史上");
 }
 
 /// 泛型遍历：编译期落到具体 `Table<T>`，运行时零擦除（没进 `dyn`，也没造行包装）。

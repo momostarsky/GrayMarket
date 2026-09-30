@@ -1,6 +1,6 @@
 # GrayDB 推进计划
 
-> 最后更新：2026-09-30　|　分支：main　|　状态：**阶段 2（日志与恢复）完成（mmap 段文件与 group commit 摊销推到阶段 3 前），下一步：阶段 3（订阅分发）或 stub 逐表转正**
+> 最后更新：2026-09-30　|　分支：main　|　状态：**阶段 3.1/3.3（订阅出口 + 按游标补发）完成（出口改用拉取式有界环，不用 tokio broadcast）；阶段 2 的 mmap 段文件与 group commit 仍推迟；下一步：阶段 3.2/3.4（订阅协议与发送侧背压）或 stub 逐表转正**
 
 ## 一、项目定位
 
@@ -49,13 +49,14 @@ GrayMarket/
     │   ├── dict/           security.json(2), user.json(3)
     │   └── state/          account.json(3), asset.json(3), position.json(2), order.json(0), trade.json(0)
     └── src/
-        ├── main.rs         启动入口（加载 + 启动报告 + 写路径样板 `demo_engine`（含恢复回放 `[8]`）+ mock_data_tests(2)
+        ├── main.rs         启动入口（加载 + 启动报告 + 写路径样板 `demo_engine`（含恢复回放 `[8]`）+ 订阅出口样板 `demo_pubsub`（`[9]`）+ mock_data_tests(2)）
         ├── generated/      ← codegen 产物（签入库，勿手改）：299 文件 = 7 登记表演示 + 1 试点 + 289 stub 真实表 + specs(TABLES) + mod
         ├── tables.rs       注册中心：Spec / DataTable(+type Column,:RowValidator) / ColVal / ColumnName / RowValidator / load_table / FkIndex / TableStat + 写路径契约（upsert/replace/delete）+ tests(12)
         ├── domain/mod.rs   业务枚举 + 7 个 impl RowValidator（人写不变量，含 Order/Trade）+ pub use generated
-        ├── engine.rs       单线程内核：RejectReason / KernelError / Ack / place / apply_fill / cancel / **recover + replay_record**（阶段 2）+ tests(15)
+        ├── engine.rs       单线程内核：RejectReason / KernelError / Ack / place / apply_fill / cancel / **recover + replay_record**（阶段 2）/ **note_row + publish_group + row_json**（阶段 3.1 出口挂钩）+ tests(22)
         ├── mem.rs          Snapshot（强类型 `Table<T>` 字段，7 表）+ 声明式校验 + 资金三原语（`Result<(), RejectReason>`）+ tests(4)
-        └── journal.rs      WAL：`Record{term,seq,entry}` / `Entry`（表名取自 `DataTable::ID`）/ `GroupWriter`（唯一写入口）/ `commit`（flush + `sync_data`）/ `read`（回放读取 + 截断判定）+ tests(2)
+        ├── journal.rs      WAL：`Record{term,seq,entry}` / `Entry`（表名取自 `DataTable::ID`）/ `GroupWriter`（唯一写入口）/ `commit`（flush + `sync_data`）/ `read`（回放读取 + 截断判定）+ tests(2)
+        └── pubsub.rs       订阅出口（阶段 3.1/3.3）：`Op` / `RowChange` / `Note` / `Broadcast`（有界环 + 游标拉取 + 整组淘汰）/ `CatchUp` + tests(4)
 ```
 
 ### 关键设计决策（已落地）
@@ -95,6 +96,11 @@ GrayMarket/
 | 真实 pg_dump 多源接入 | 每表 `source`（sql 文件）+ `table`（DDL 名，可后缀匹配 schema 限定）；解析器吃多词类型/内联约束/IDENTITY/非建表语句；numeric 映射优先级 `types` 逐列 > `numeric_default` 整表，都缺即报错 | 阶段 0.8 |
 | `register=false` 迁移态 | 只生成 struct（含空 `RowValidator`，文件机器独占）不进 `TABLES`/不加载/不校验 —— 绕开「登记即须 Snapshot 字段+数据文件」的全套接入成本，真实表可一张一张搬 | 阶段 0.8 |
 | stub 整表搬入 | `[[stub]] source` 把整份 dump 一键展开成占位 struct：全名 Pascal 防跨模块撞名、pk 统一 `row_id`（缺列精确报错、无主键表 `exclude`）、numeric→`Decimal` 无损占位；转正 = 写同表 `[[table]]` 自动让位 | 阶段 0.9 |
+| 订阅出口选型：拉取式有界环 | 原计划用 `tokio::sync::broadcast`，实施时否决：推送式把「消费者速度」变成写路径的一部分（channel 满 → 要么阻塞内核，要么在内核里做丢弃决策），正面撞铁律 5。改为 `Broadcast`（有界环）+ 消费者自带游标 `catch_up(after_seq)`：内核只做 O(组大小) 的 append，无锁、无 IO、无回调，落后与淘汰的后果全留在读侧。异步 runtime 属网络发送侧（3.4 之后），不进内核 | `pubsub.rs`（阶段 3.1） |
+| 登记键、发布取值 | 写路径调 `note_row::<T>(key, op)` 只把 `(T::ID, key, op)` 记进 `pending`（表名取自类型，不写字符串字面量）；行内容在 `publish_group(seq)` 时从 `Snapshot` **现读** —— 同一组里资金行可能被结算与市值重算连改两次，登记时取值会发布中间态。同 `(table, key)` 合并成一条，后 op 覆盖前 op（先 upsert 后 delete 只发一条 `Delete`，且不带行值） | `engine::{note_row, publish_group}` |
+| 出口守卫 = `alloc_seq` 查 pending | 下一组分配序号前 `pending` 必须为空，否则 panic。一次拦住两种事故：入口漏挂 `publish_group`（改了内存没发布）、落盘之后改内存失败（日志与内存已分叉）—— 都是停内核而不是默默少发一批 | `engine::alloc_seq`（阶段 3.1） |
+| 回放不发布 | `Engine::recover` 末尾 `pending.clear()`，恢复出的环为空、`published=0`：恢复是重建内核自己的状态，不是给下游重放一遍历史；崩溃前的跨进程历史由 `catch_up` 判 `Lagged`（拿不到比拿错安全），下游走快照重建 | `Engine::recover` |
+| 淘汰按整组 | `evict` 只把最老一组**整个**丢完（半组历史比没有更危险：下游会拿到 seq 连续但内容缺行的假 Delta）；最新一组即使超容量也保留 —— 容量是「留存下限」而不是硬上限，`dropped_rows` 是慢消费者唯一可见的证据 | `pubsub::Broadcast::evict` |
 
 ### Mock 数据的自洽不变量（已有测试守护）
 
@@ -117,6 +123,9 @@ journal 可采信的三个条件：表名已登记 / 行内 seq == 信封 seq / 
 lot_size > 0 && price_tick > 0                       ← `impl RowValidator for Security`
 JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机械校验（`pk_parts` 已删）
 每张表行数 == `Spec::expected_rows`                   ← mock 阶段数据回归哨兵（接 PG 后置 None）
+发布集合 == 前后镜像的真实行差异（含 delete）        ← `note_row`/`publish_group` + `changed_rows` 守护测试（阶段 3.1）
+静置时「已发布组序号 == 已落盘序号」                    ← `Broadcast::published` == `Engine::durable`（阶段 3.1）
+消费者落后只表现为 `Lagged`，永不回压写路径              ← 有界环 + 整组淘汰（阶段 3.1/3.3）
 ```
 
 当前测试清单：
@@ -124,8 +133,9 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 | 位置 | 测试 |
 |---|---|
 | `graydb/src/tables.rs` | 12 个守护测试：`table_ids_are_unique_and_match_files`、`every_declared_table_is_loaded_and_nonempty_or_marked`、`critical_table_missing_refuses_startup`、`optional_table_degrades_to_empty_and_is_marked`、`fk_violation_is_caught_from_declaration_only`、`primary_key_must_match_json_outer_key`、`composite_key_mixed_segments_render_stably`、`column_name_round_trips_and_rejects_unknown`、`int_primary_key_is_supported_end_to_end`、`generated_column_enums_cover_declared_columns`、`upsert_clears_old_index_values_on_reindex_column`（防线①）、`upsert_enforces_check_row_before_any_mutation`（防线②） |
-| `graydb/src/engine.rs` | 15 个全链路测试：`buy_fill_conserves_cash_position_and_seq`、`rejection_leaves_zero_state_delta`、`duplicate_order_id_is_idempotent_not_double_frozen`、`duplicate_trade_id_is_idempotent_not_double_settled`、`partial_fill_then_cancel_settles_exactly`、`partial_sell_fill_keeps_remaining_lock`、`t_plus_one_blocks_same_day_buy_from_selling`、`sell_fill_settles_lock_and_credit`、`fill_validation_rejects_bad_price_and_overfill`、`seq_is_monotonic_and_gapless`、`journal_records_the_whole_group_under_one_seq`（读回取证信封：seq 稠密 + 表名 + 行内 seq）、`weighted_avg_price_rounds_once_at_the_end`、`replay_reconstructs_the_exact_final_state`（阶段 2.3 守护）、`replay_drops_partial_tail_and_stops_at_the_last_complete_record`（阶段 2.4）、`replay_refuses_interior_corruption_and_seq_gap`（坏日志一律拒收） |
+| `graydb/src/engine.rs` | 22 个全链路测试：`buy_fill_conserves_cash_position_and_seq`、`rejection_leaves_zero_state_delta`、`duplicate_order_id_is_idempotent_not_double_frozen`、`duplicate_trade_id_is_idempotent_not_double_settled`、`partial_fill_then_cancel_settles_exactly`、`partial_sell_fill_keeps_remaining_lock`、`t_plus_one_blocks_same_day_buy_from_selling`、`sell_fill_settles_lock_and_credit`、`fill_validation_rejects_bad_price_and_overfill`、`seq_is_monotonic_and_gapless`、`journal_records_the_whole_group_under_one_seq`（读回取证信封：seq 稠密 + 表名 + 行内 seq）、`weighted_avg_price_rounds_once_at_the_end`、`replay_reconstructs_the_exact_final_state`（阶段 2.3 守护）、`replay_drops_partial_tail_and_stops_at_the_last_complete_record`（阶段 2.4）、`replay_refuses_interior_corruption_and_seq_gap`（坏日志一律拒收）、**阶段 3.1/3.3 七个**：`published_groups_match_the_real_row_diff`（发布集合 == `changed_rows` 独立算出的真实差异，含清仓 `delete`）、`each_subscriber_pulls_its_own_contiguous_slice`（游标各自连续、跟平时空 Delta）、`a_lagging_subscriber_is_dropped_without_touching_the_write_path`（小环降级不碰写路径）、`replay_rebuilds_state_without_publishing`、`row_json_dispatches_every_mutable_table`、`unregistered_table_panics_instead_of_being_dropped`、`unpublished_changes_stop_the_next_group` |
 | `graydb/src/journal.rs` | `table_tag_matches_registry_identity`（serde 外部标签 == `DataTable::ID` == `Spec::id`）、`record_round_trips_with_envelope`（`{term,seq,entry}` 写读往返） |
+| `graydb/src/pubsub.rs` | 4 个：`unknown_table_is_refused_at_the_boundary`（未登记表在出口边界即拒）、`row_change_serializes_with_registry_identity`（帧里表名 == `Spec::id`）、`eviction_never_splits_a_group`（整组淘汰 + `dropped_rows` 计数）、`lagging_cursor_degrades_instead_of_returning_a_hole`（跌出窗口判 `Lagged`，不给缺段 Delta） |
 | `graydb/src/mem.rs` | `loads_all_mock_json_into_memory`（7 表，orders/trades 日初为空）、`tradability_respects_account_and_dict`、`freeze_conserves_available_plus_frozen`（含 `checked_sub` 允许负值的拦截）、`composite_key_is_stable_and_matches_json_layout` |
 | `graydb/src/main.rs` | `all_mock_json_files_match_domain_structs`（改用 `Snapshot::load`）、`asset_invariants_hold`（测试自行复算市值，不复用生产实现） |
 | `account/src/amount.rs` | 32 个：标度显示 / 边界 / widen-narrow / 5 种舍入 / Decimal 互转 / notional / 三段式落账 / settle 错误 / 序列化格式 / 越界拒绝 / 枚举 snake_case |
@@ -307,14 +317,26 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 - 口径纠正：`Recovery::replayed` 数的是**记录条数**（该场景 11 条），`seq` 数的是**事务组数**（8 组）—— 三个成交组各 2 条，两者天然不相等。
 - 遗留（不在本阶段做）：恢复起点强制「日初镜像 + 首条 seq=1」（拿当日 `save()` 的脏镜像重放会重复冻结，`recover` 直接拒收），而 `expected_rows` 的日初哨兵使脏镜像无法 `load()` → 真跨日重启需先做日切归档（阶段 4 接 PG 时一并处理）；跨 term 日志与从库接管属阶段 5。
 
-### 阶段 3：订阅分发
+### 🔶 阶段 3：订阅分发（已完成 3.1 / 3.3；出口选型偏离原计划）
 
-- 3.1 在写路径唯一出口挂 `tokio::sync::broadcast<RowChange>`；
-- 3.2 协议：`Subscribe { tables, ops, snapshot, columns, filter }`；帧含 `SNAPSHOT_BEGIN / ROW / SNAPSHOT_END` 屏障；
-- 3.3 断线按 `seq` 从 ring buffer 补发，补不齐降级为重新下发快照；
-- 3.4 慢消费者隔离：broadcast 丢包 → 客户端触发快照重建，不拖累内核主循环；
-- 3.5 主题粒度：`table:{spec.id}`、`table:{schema}.*`、`table:*`；`tables` 入参用 `spec_of()` 校验，未知表名直接拒绝订阅；
-- 3.6 全量快照下发遍历 `TABLES`，无需为新表改订阅代码。
+目标：把「内核写完」变成「下游能看见」，同时守住铁律 5 —— 订阅与查询永不成为写路径的一部分。
+
+| 任务 | 说明 |
+|---|---|
+| ✅ 3.1 写路径出口 | 每个事务组在内存变更**全部成功**后 `publish_group(seq)`：把本组 `pending` 里的 `(table, key, op)` 从 `Snapshot` 现读成终态镜像，盖上 `(term, seq)` 追加进有界环。登记入口 `note_row::<T>` 的表名取自 `DataTable::ID`（与 WAL / topic / PG 同源）；没有 `row_json` 分派臂的表在发布时 panic，不留静默丢变更。入口共 13 处 `note_row` + 3 处 `publish_group`（place / apply_fill / cancel） |
+| ✅ 3.3 断线补发 | 消费者自带游标调 `catch_up(after_seq)`：窗口罩得住 → `Delta{from, through, changes}`（跟平时是 `from > through` 的空 `changes`，不是降级）；罩不住 → `Lagged{lost_through, oldest_seq}`，唯一正确处置是重新下发快照，**绝不返回缺段的 Delta** |
+| ⏸ 3.2 订阅协议 | `Subscribe { tables, ops, snapshot, columns, filter }` + `SNAPSHOT_BEGIN / ROW / SNAPSHOT_END` 帧屏障：需要网络层，与 3.4 一并做 |
+| ⏸ 3.4 慢消费者隔离 | per-connection 发送队列与背压（内核侧已由 3.1 的拉取式环把「等消费者」结构性排除，剩下的只是发送侧自己排队）；快照重建路径依赖 3.2 |
+| ⏸ 3.5 主题粒度 | `table:{spec.id}` / `table:{schema}.*` / `table:*`；`tables` 入参用 `spec_of()` 校验，未知表名直接拒绝订阅（`unknown_table_is_refused_at_the_boundary` 已先把「边界拒绝」钉住） |
+| ⏸ 3.6 全量快照下发 | 遍历 `TABLES` 出快照，新表零改动 —— 与 3.2 的 `SNAPSHOT_*` 帧同批 |
+
+**验收结果**（2026-09-30）：
+
+- `cargo test --workspace` **82 passed**（account 32 + graydb 46 + codegen 4），其中 `pubsub.rs` 新增 4 个、`engine.rs` 15 → 22；`cargo clippy --workspace --all-targets` 零警告；`cargo run -p graydb` 新增 `[9] 订阅出口` 一段：四个事务组共 10 行变更按游标一次补出（seq=2 的 `position A001:09018` 是 `Delete` 且不带行值），小环（容量 1 行）已发布 2 组 / 留存 2 行 / 已淘汰 2 行，游标 0 判 `Lagged` 而内核 `seq == durable`。
+- **守护口径 = 拿独立算式当 oracle**：`step()` 每步深拷贝前后 `Snapshot`，用 `changed_rows(before, after)`（逐行 JSON 比对，含删除）算出「真实差异」，与环里该组的发布集合逐项对齐；再核对每条发布行的值 == 表里现读那一行。入口的 13 个变更点因此不需人工数一遍 —— 漏挂任何一处（含 `delete` 与走 `rows_mut()` 的原地改）直接红。
+- **两种事故靠一个守卫拦下**：`alloc_seq` 开头查 `pending` 为空 —— 入口漏挂 `publish_group`（改了内存没发布）与落盘后改内存失败（日志与内存已分叉）都会在下一次分配序号时炸掉，不会走到「默默少发一批却无人知晓」。
+- **偏离原计划**：3.1 不用 `tokio::sync::broadcast`。推送式的 channel 满 → 阻塞或丢弃，两种决策都发生在内核里，等于让订阅端的速度进写路径；改成有界环 + 游标拉取后，内核成本恒为 O(组大小) 的 append，淘汰只伤落后者自己（`a_lagging_subscriber_is_dropped_without_touching_the_write_path` 用小环跑出来）。异步 runtime 留给 3.4 的发送侧。
+- 已知边界（本阶段刻意不做）：环是**进程内**的，跨进程历史不在环里（重启后 `published=0`，一切走快照重建）；容量按行数而非字节，一条宽行的成本未计量；`RowChange` 现在带整行 JSON，按 `columns` 裁剪属 3.2。
 
 ### 阶段 4：接入真实 PG
 
@@ -344,13 +366,14 @@ JSON 外层键 == composite_key(Spec::pk 逐列 column())   ← `load_table` 机
 ```powershell
 cargo test                      # 全 workspace
 cargo test -p account           # 定点数与序列化测试
-cargo test -p graydb            # 35 个测试：tables 12 + engine 15 + journal 2 + mem 4 + mock 2
+cargo test -p graydb            # 46 个测试：tables 12 + engine 22 + pubsub 4 + journal 2 + mem 4 + mock 2
 cargo test -p graydb tables::    # 只跑表清单/注册中心守护测试
 cargo test -p graydb engine::    # 只跑内核写路径与回放恢复测试
 cargo test -p graydb journal::   # 只跑 WAL 信封 / 落盘 / 截断判定测试
+cargo test -p graydb pubsub::    # 只跑订阅出口 / 有界环淘汰 / 游标补发降级测试
 cargo clippy --workspace --all-targets
 cargo codegen                   # 改 DDL/tables.toml 后重生成 graydb/src/generated（= run -p codegen）
-cargo run -p graydb             # 加载 + 按 TABLES 打印启动报告 + `[7]` 写路径 + `[8]` 日志恢复
+cargo run -p graydb             # 加载 + 按 TABLES 打印启动报告 + `[7]` 写路径 + `[8]` 日志恢复 + `[9]` 订阅出口
 cargo run                       # 根 package GrayMarket
 ```
 
@@ -386,5 +409,5 @@ RustRover：Cargo 面板 → `graydb > tests` 可批量运行；`Cargo.toml` 变
 | `Table::upsert` 索引只增不删、入口不校验 | 写路径一开即脏写入口 + 外键假阳性 | ✅ 已处：阶段 1.9–1.10（入口强制 `check_row`、索引清旧值、`upsert`/`replace`/`delete` 分工），各配守护测试 |
 | seq 空洞（panic 回滚 / 任务丢包） | 日志与内存分叉，无法收敛 | 阶段 1.3 fail-fast |
 | 把 `Amount::checked_sub` 当「不够减」用 | 余额/持仓被扣成负值，而金额层不报错；超量成交这类拒单分不出，到下游才变成不相干的错误 | 阶段 1：扣减统一过 `!is_negative`（`sub_or_negative`），「够不够」用 `Ord` 比较 |
-| 订阅端拖慢内核主循环 | 全市场延迟劣化 | 阶段 3.4 慢消费者隔离 |
+| 订阅端拖慢内核主循环 | 全市场延迟劣化 | ✅ 部分已缓解（阶段 3.1）：出口是拉取式有界环，内核 append 不等任何消费者，慢消费者只伤自己的历史（整组淘汰 + `Lagged` 降级）；per-connection 发送侧背压隔离仍属阶段 3.4 |
 | `Rounding` 反序列化退化为默认值 | 静默改变金额 | 已禁 `#[serde(other)]`，未知即 `Err` |
