@@ -5,7 +5,8 @@
 //! 理由不是省事 —— 推送式广播会把「消费者速度」变成写路径的一部分（订阅者慢 → channel
 //! 满 → 要么阻塞内核要么在内核里做丢弃决策），正面撞铁律 5。拉取式把后果留在读侧：
 //! 内核只做一次 O(组大小) 的 append，追不上的消费者由**它自己**承担历史被淘汰。
-//! 异步 runtime 属于网络发送侧（3.4 之后），那时才需要真并发；现在单线程内核先不背这个依赖。
+//! 异步 runtime 已在 3.4 落到网络发送侧（`net.rs`），但它只接在 [`CatchUp`] 之后：
+//! 内核从不调用任何 `await`，发送侧的速度差异全部落在它自己的有界队列与游标不推进上。
 //!
 //! 三处设计钉住铁律 5：
 //! - [`Broadcast::publish_group`] 无锁、无 IO、不回调任何订阅方；
@@ -176,6 +177,10 @@ impl Broadcast {
 
     /// 3.3 补发：给出 `after_seq` 之后的全部变更，或明确告知「补不齐」。
     /// （返回值已在类型上标 `#[must_use]`，这里不再叠一层。）
+    ///
+    /// 从**尾部反向**定位补发段：环按 seq 非降序排列，要补的永远是尾部连续的一截。
+    /// 从头部扫是 O(环容量) —— 那会让每组的扇出成本跟着「最慢的连接有多旧」走，
+    /// 等于把消费者的账记到内核头上（铁律 5）。反向扫是 O(补发段 + 1)。
     pub fn catch_up(&self, after_seq: i64) -> CatchUp {
         if after_seq >= self.published {
             return CatchUp::Delta {
@@ -185,21 +190,25 @@ impl Broadcast {
             };
         }
         let oldest = self.ring.front().map(|change| change.seq);
-        if oldest.is_some_and(|oldest| after_seq + 1 >= oldest) {
-            return CatchUp::Delta {
-                from: after_seq + 1,
-                through: self.published,
-                changes: self
-                    .ring
-                    .iter()
-                    .filter(|change| change.seq > after_seq)
-                    .cloned()
-                    .collect(),
+        if !oldest.is_some_and(|oldest| after_seq + 1 >= oldest) {
+            return CatchUp::Lagged {
+                lost_through: self.lost_through,
+                oldest_seq: oldest,
             };
         }
-        CatchUp::Lagged {
-            lost_through: self.lost_through,
-            oldest_seq: oldest,
+        let mut changes: Vec<RowChange> = self
+            .ring
+            .iter()
+            .rev()
+            .take_while(|change| change.seq > after_seq)
+            .cloned()
+            .collect();
+        // 整体倒回来：组内顺序（order → trade → 资金行）也跟着恢复，不能只改组间升序。
+        changes.reverse();
+        CatchUp::Delta {
+            from: after_seq + 1,
+            through: self.published,
+            changes,
         }
     }
 
@@ -342,15 +351,28 @@ impl Columns {
 }
 
 /// 订阅请求。默认值 = 最保守也最常用的一份：全表快照、两种 op、全列、不过滤。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 出站与入站都走 JSON：入站是 3.4 的网络请求体，字段全为拥有型（`Vec<String>`），
+/// 所以能直接 `from_str`。`deny_unknown_fields` 只加在**请求**上：客户端把
+/// `tabels` 拼错必须当场报错，而不是静悄悄按「没过滤全表」跑起来 ——
+/// 帧（出站）反过来允许未知字段，好让旧消费者读得到新增字段（见 `wire.rs`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "snake_case")]
 pub struct Subscribe {
     /// 表身份清单（`Spec::id`），由 [`Subscribe::validate`] 逐项核对注册中心。
+    /// 省略 = 空清单，到 `validate` 被 `EmptyTables` 拒；不做「省略就订全部」的猜测。
     pub tables: Vec<String>,
     /// 关心哪些动作；只订 `Delete` 时不得再要快照（快照本质全是 `Upsert`）。
+    /// 省略 = 两种都要（与 `Default` 的「最保守也最常用」一致）。
+    #[serde(default = "all_ops")]
     pub ops: Vec<Op>,
     pub snapshot: SnapshotMode,
     pub columns: Columns,
     pub filter: Filter,
+}
+
+fn all_ops() -> Vec<Op> {
+    vec![Op::Upsert, Op::Delete]
 }
 
 impl Subscribe {
@@ -524,18 +546,32 @@ impl Subscriber {
 
     /// 增量批的落地动作：过滤 + 裁列，并把水位推进到 `through`。
     pub(crate) fn take_batch(&mut self, through: i64, changes: Vec<RowChange>) -> Vec<RowChange> {
-        let picked: Vec<RowChange> = changes
-            .into_iter()
-            .filter(|change| {
-                self.admits_op(change.op) && self.admits_key(change.table, &change.key)
-            })
-            .map(|change| RowChange {
-                row: change.row.map(|row| self.project(change.table, row)),
-                ..change
-            })
-            .collect();
+        let picked = self.peek_batch(&changes);
         self.cursor = through;
         picked
+    }
+
+    /// 只过滤 + 裁列，**不推进游标** —— 3.4 发送侧的「先确认投得出去，再提交水位」靠这一步拆开。
+    ///
+    /// 合在一起做就会失去退路：一旦 `try_send` 发现队列满了，水位已经推进，那段历史
+    /// 对这个连接就永久消失了（它既拿不到帧，也不会被判落后 —— 静默少数据）。
+    pub(crate) fn peek_batch(&self, changes: &[RowChange]) -> Vec<RowChange> {
+        changes
+            .iter()
+            .filter(|change| self.admits_op(change.op) && self.admits_key(change.table, &change.key))
+            .map(|change| {
+                let mut kept = change.clone();
+                if let Some(row) = kept.row.take() {
+                    kept.row = Some(self.project(kept.table, row));
+                }
+                kept
+            })
+            .collect()
+    }
+
+    /// 提交水位：`peek_batch` 的产物确认落到发送队列之后才调。
+    pub(crate) fn commit(&mut self, through: i64) {
+        self.cursor = through;
     }
 }
 

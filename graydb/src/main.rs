@@ -3,20 +3,26 @@ pub mod domain;
 pub mod engine;
 pub mod generated;
 pub mod mem;
+pub mod net;
 pub mod pubsub;
 pub mod tables;
+pub mod wire;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use account::amount::{Money, Price, Quantity, Rounding, notional};
+use tokio::net::TcpListener;
 
 use crate::domain::{Security, Side};
 use crate::engine::{Engine, PlaceRequest};
 use crate::journal::Journal;
 use crate::mem::Snapshot;
+use crate::net::{Client, Hub, NetError, serve};
 use crate::pubsub::{CatchUp, Frame, Op, RowChange, Subscribe};
 use crate::tables::{ColumnName, DataTable, composite_key_str};
+use crate::wire::WireFrame;
 
 fn main() {
     println!("Hello, GrayDB!");
@@ -38,6 +44,14 @@ fn main() {
     demo_engine(&data_root);
     demo_pubsub(&data_root);
     demo_protocol(&data_root);
+
+    // 阶段 3.4 要真 socket，所以这一段自己起一个 runtime。它**没有**改内核的形状：
+    // `demo_send_side` 里持 `Engine` 与 `Hub` 的那几段全是同步调用，一次 `await` 都没有。
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime 起不来");
+    runtime.block_on(demo_send_side(&data_root));
 }
 
 /// 加载：三种粒度按需选。
@@ -616,6 +630,202 @@ fn demo_protocol(root: &Path) {
         frames.len(),
         rebuilt.cursor(),
     );
+}
+
+/// 演示用的一笔下单：A002 买 100 股 600000（只下单不成交，一组 = 订单一行 + 资金一行）。
+/// 抽出来是因为 [11] 要把同一个写动作重复几十组，而不必每次重抄七个字段。
+fn place_one(engine: &mut Engine, order_id: &str) -> i64 {
+    engine
+        .place(PlaceRequest {
+            order_id,
+            account_id: "A002",
+            symbol: "600000",
+            side: Side::Buy,
+            price: Price::from_units(60_600),
+            quantity: Quantity::from_units(100),
+            created_at: "2026-09-29T09:40:00Z",
+        })
+        .expect("演示下单不应被拒")
+        .seq()
+}
+
+/// 发送侧的对账：消费者镜像（表名是 `String`）与内核当前行集逐表相等。
+/// 两边都是 `BTreeMap`，键序稳定，所以比的是值本身，不需要先排序再凑。
+fn assert_matches_kernel(mirror: &crate::wire::Mirror, kernel: &Mirror) {
+    assert_eq!(mirror.tables().len(), kernel.len(), "镜像里的表数与订阅不符");
+    for (table, rows) in kernel {
+        assert_eq!(mirror.table(table), Some(rows), "表 {table} 两端逐行不等");
+    }
+}
+
+/// 阶段 3.4：发送侧。真 socket 上跑一遍「快照 → 增量 → 越界拒订 → 慢连接被降级 → 收摊摘除」。
+/// 铁律 5 在这一层的验收标准只有一条：**持 `Engine` 与 `Hub` 的那段代码一次 `await` 都不许有**；
+/// 下面的 `drain_commands` / `fan_out` 全是同步调用，跨线程只传已拥有的 `String`。
+async fn demo_send_side(root: &Path) {
+    println!("\n[11] 发送侧：Hub 扇出 + 每连接独立队列（慢连接只慢自己）");
+
+    const TABLE_LIST: &[&str] = &["account_asset", "orders", "trades", "position"];
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("graydb-demo-net-{}.journal.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let journal = Journal::open(&path).expect("演示 journal 打开失败");
+    // 补发窗口只留 8 行（≈ 4 组）：让「慢连接跌出窗口」在这段演示里真会发生，而不是只在测试里。
+    let mut engine = Engine::with_ring(Snapshot::load(root).expect("重新加载一份干净镜像"), journal, 8);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("回环监听起不来");
+    let addr = listener.local_addr().expect("已绑定就该有端口");
+    // 队列容量 4 批是**服务端**策略，不能来自请求：那等于让客户端决定内核侧占多少内存。
+    let (commands, mut hub) = Hub::new(4);
+    tokio::spawn(serve(listener, commands));
+
+    let spec = Subscribe::new(TABLE_LIST);
+    let mut quick = Client::connect(addr, &spec).await.expect("A 的连接应能建立");
+    let mut idle = Client::connect(addr, &spec).await.expect("B 的连接应能建立");
+    let mut out_of_scope =
+        Client::connect(addr, &Subscribe::new(&["orders"]).accounts(&["A001"])).await
+            .expect("C 的连接能建立，被拒的是请求");
+    // 内核不因为有人连上来就等：握手只在下一次 `drain_commands` 里被 `try_recv` 收干，
+    // 所以这里得转几圈。真循环里这几圈就是写路径的下一组，不是给连接让的路。
+    for _ in 0..100 {
+        hub.drain_commands(&engine);
+        if hub.connections() == 2 && hub.stats().refused == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hub.connections(), 2, "合规的两条该登记，越界那条不该");
+
+    // ① 越界请求在真 socket 上拿到的是那句人话：只关连接的话，客户端只能从 EOF 反推，
+    //    而 EOF 与「网络掉了」分不开。
+    let refused = out_of_scope.finish_snapshot().await.expect_err("越界请求不该读到快照");
+    assert!(matches!(refused, NetError::Refused(_)), "实得：{refused}");
+    println!("  C 越界请求 → {refused}");
+
+    // ② 两条合规连接各自收下全表快照，镜像与内核逐行相等 —— 编解码边界的端到端证明。
+    quick.finish_snapshot().await.expect("A 该读完快照");
+    idle.finish_snapshot().await.expect("B 该读完快照");
+    for (who, client) in [("A", &quick), ("B", &idle)] {
+        assert_matches_kernel(client.mirror(), &kernel_mirror(&engine, TABLE_LIST));
+        println!("  {who} 快照读完：{}", client.mirror().summary());
+    }
+
+    // ③ 十组下单：内核写 → 同步扇出 → 只有 A 去读。B 一行不读，但它自己的任务在把批
+    //    写进自己的 socket 缓冲，所以它慢在自己的那头；内核这边一帧都没少发、一步都没等。
+    for index in 1..=10 {
+        place_one(&mut engine, &format!("O-NET-{index}"));
+        let round = hub.fan_out(&engine);
+        quick.advance_to(engine.durable()).await.expect("A 该一直跟得上");
+        if index <= 2 {
+            println!(
+                "  第 {index} 组：seq={} 本轮扇出 {} 帧、退让 {} 批",
+                engine.seq(), round.frames, round.stalled
+            );
+        }
+    }
+    assert_matches_kernel(quick.mirror(), &kernel_mirror(&engine, TABLE_LIST));
+    println!("  A 跟到水位 {}：{}", quick.mirror().last_through(), quick.mirror().summary());
+
+    // ④ 慢连接被降级。这里再登记一条连接，把它的 `rx` 握在演示手里不读：它就是
+    //    「对端还在、但一个字节都不取」的精确模型 —— 背压走的是与 socket 完全同一条代码，
+    //    而只有把它放在内核侧才确定性地能推到跌出补发窗口（不靠网速撞运气）。
+    let slow = hub
+        .attach_with(&engine, Subscribe::new(TABLE_LIST), 2)
+        .expect("演示用的慢连接应能登记");
+    let slow_id = slow.id;
+    let mut slow_rx = slow.rx;
+    println!("  登记慢连接 D（id={slow_id}，队列 2 批）");
+    for index in 11..=14 {
+        place_one(&mut engine, &format!("O-NET-{index}"));
+        let round = hub.fan_out(&engine);
+        quick.advance_to(engine.durable()).await.expect("A 该一直跟得上");
+        println!(
+            "  第 {index} 组（D 一帧不取）：扇出 {} 帧、退让 {} 批、判落后 {} 条",
+            round.frames, round.stalled, round.lagged
+        );
+    }
+    // D 每收一次就又要它「一帧不取」六组：队列 2 批先填满，之后的扇出全记成退让，而环继续
+    // 淘汰，直到把它的游标甩出补发窗口。队列满的时候连降级信号也投不出去 —— 投不出去
+    // 就是还没退让成功，不能当作已降级，所以只有腾出位置的那一轮才可能收到它。
+    let mut degraded = None;
+    let mut group = 15;
+    for phase in 1..=4 {
+        // 先把上一阶段攒着的取走（只看字节不看内容），给队列腾出位置。
+        let mut lines: Vec<String> = Vec::new();
+        while let Ok(batch) = slow_rx.try_recv() {
+            lines.extend(batch);
+        }
+        for _ in 0..6 {
+            place_one(&mut engine, &format!("O-NET-{group}"));
+            group += 1;
+            hub.fan_out(&engine);
+            quick.advance_to(engine.durable()).await.expect("A 该一直跟得上");
+        }
+        while let Ok(batch) = slow_rx.try_recv() {
+            lines.extend(batch);
+        }
+        for line in &lines {
+            // 服务端发出的行必能解回来：这一步顺手拿真数据把解码边界也走了一遍。
+            if let WireFrame::RebuildRequired { lost_through } = wire::decode_line(line).expect("行该解得开") {
+                degraded = Some(lost_through);
+            }
+        }
+        println!(
+            "  D 第 {phase} 阶段取走 {} 行，{}",
+            lines.len(),
+            if degraded.is_some() { "已收到重建信号" } else { "游标仍在窗口内，本阶段只拿到补发增量" }
+        );
+        if degraded.is_some() {
+            break;
+        }
+    }
+    let lost_through = degraded.expect("D 一直不消费，该跌出补发窗口拿到重建信号");
+
+    // 降级之后内核不再给它增量（继续发只会让它以为自己能续上）：再走一轮，D 的游标一分不动，
+    // 而 A 照常追到当前位。缺口不能靠推进掩盖 —— 这条与 3.6 的订阅者口径是同一份。
+    let cursor_before = hub.cursor_of(slow_id).expect("D 还在登记里");
+    place_one(&mut engine, "O-NET-AFTER-REBUILD");
+    hub.fan_out(&engine);
+    quick.advance_to(engine.durable()).await.expect("A 该一直跟得上");
+    assert_matches_kernel(quick.mirror(), &kernel_mirror(&engine, TABLE_LIST));
+    assert_eq!(hub.cursor_of(slow_id), Some(cursor_before), "已降级的连接游标不该被推进");
+    assert!(cursor_before <= lost_through, "游标停在缺口之内才会被判落后：{cursor_before} vs {lost_through}");
+    let (_, d_cursor, d_paused, d_stalled) = hub
+        .cursors()
+        .into_iter()
+        .find(|(id, ..)| *id == slow_id)
+        .expect("D 还在登记里");
+    println!(
+        "  D 降级后：游标停在 {d_cursor}（已降级={d_paused}，自己退让 {d_stalled} 批），而 A 已到 {}",
+        quick.mirror().last_through()
+    );
+    assert!(d_paused, "被判落后的连接不该再收增量");
+
+    // ⑤ 对端收摊：`rx` 被 drop 之后，下一轮扇出用 `try_reserve` 探到 Closed 并当场摘除。
+    //   不探这一步，一条写不出帧的死连接永远没机会被发现（没新组 → 不 try_send → 不看错）。
+    drop(slow_rx);
+    let round = hub.fan_out(&engine);
+    assert_eq!(round.detached, 1, "对端收摊该在这一轮就被摘掉");
+    quick.advance_to(engine.durable()).await.expect("A 该一直跟得上");
+    println!(
+        "  D 收摊 → 本轮摘除 {} 条，登记表剩 {} 条连接",
+        round.detached,
+        hub.connections()
+    );
+
+    println!("  最终登记（id, 游标, 已降级, 退让批数）：{:?}", hub.cursors());
+    // B 一行不读，它的客户端镜像停在快照那 5 行；而服务端侧的游标已跟着走到当前位 ——
+    // 那批字节正待在它自己的 socket 缓冲里。「慢」是它自己的事，不是内核少发了。
+    println!("  B（从不读一行）的镜像：{}", idle.mirror().summary());
+    println!("  发送侧累计：{}", hub.stats());
+    println!(
+        "  内核：seq={} durable={} orders={}（全程没有为连接推迟过任何一笔写入）",
+        engine.seq(),
+        engine.durable(),
+        engine.snapshot.orders.len()
+    );
+    assert_eq!(engine.durable(), engine.seq(), "到最后落盘应追平受理");
+    assert_matches_kernel(quick.mirror(), &kernel_mirror(&engine, TABLE_LIST));
 }
 
 /// 内核当前镜像（只取本订阅者订的那几张表）：走 `Snapshot::rows_json` 的分派臂。
