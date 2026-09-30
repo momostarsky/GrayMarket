@@ -8,8 +8,8 @@ use account::amount::{Money, Price, Quantity, Rounding, notional};
 use crate::domain::{Account, AccountStatus, Asset, Order, Position, Security, Trade, User};
 use crate::engine::RejectReason;
 use crate::tables::{
-    DataTable, FkIndex, Table, TableStat, check_registry_shape, composite_key_str, load_table,
-    save_table,
+    ColumnName, DataTable, FkIndex, Table, TableStat, check_registry_shape, composite_key_str,
+    load_table, save_table,
 };
 
 /// 一次性载入的全部主数据 —— 对应「日初加载进内存」的边界。
@@ -183,6 +183,64 @@ impl Snapshot {
         account_active && self.securities.contains_key(symbol)
     }
 
+    // ── 读侧按表身份取行（阶段 3.2 / 3.6）──────────────────────────
+    //
+    // 三个入口共用同一张分派表：出口发布取一行、快照下发扫全表、订阅校验取列名。
+    // 新表登记后必须在这里加臂 —— 漏臂的后果是 `panic`，而不是给下游静默少一行／少一张表。
+
+    /// 表身份（`Spec::id`）→ 单行 JSON。行→JSON 只走 serde 一条路：与 journal 落盘、
+    /// [`Snapshot::save`] 同一份序列化实现，订阅端拿到的数字与日志里的不可能不一致。
+    #[must_use]
+    pub fn row_json(&self, table: &str, key: &str) -> Option<serde_json::Value> {
+        match table {
+            User::ID => self.users.get(key).map(encode_row),
+            Account::ID => self.accounts.get(key).map(encode_row),
+            Security::ID => self.securities.get(key).map(encode_row),
+            Asset::ID => self.assets.get(key).map(encode_row),
+            Position::ID => self.positions.get(key).map(encode_row),
+            Order::ID => self.orders.get(key).map(encode_row),
+            Trade::ID => self.trades.get(key).map(encode_row),
+            other => panic!("表 {other:?} 未接入读侧取行分派（row_json 缺臂）"),
+        }
+    }
+
+    /// 表身份 → 全表 `(行键, 行 JSON)`，按键排序（3.6）。
+    ///
+    /// 快照下发的表清单来自订阅请求（已按 `spec_of` 校验），取行只靠这一层分派，
+    /// 协议代码不为新表改一行。排序是为了让下发顺序可重复、逐帧对得上。
+    #[must_use]
+    pub fn rows_json(&self, table: &str) -> Vec<(String, serde_json::Value)> {
+        let mut rows: Vec<(String, serde_json::Value)> = match table {
+            User::ID => mirror_rows(&self.users),
+            Account::ID => mirror_rows(&self.accounts),
+            Security::ID => mirror_rows(&self.securities),
+            Asset::ID => mirror_rows(&self.assets),
+            Position::ID => mirror_rows(&self.positions),
+            Order::ID => mirror_rows(&self.orders),
+            Trade::ID => mirror_rows(&self.trades),
+            other => panic!("表 {other:?} 未接入读侧取行分派（rows_json 缺臂）"),
+        };
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    }
+
+    /// 某表的全部列名。`Spec` 本身不带列清单（只有 `pk`/`fk`），列名的唯一事实源
+    /// 是 codegen 生成的列枚举 `Column::ALL` —— 订阅请求里的 `columns` / `filter`
+    /// 靠这份清单核对，未声明的列名在 attach 时就被拒，不留到运行期。
+    #[must_use]
+    pub fn columns_of(table: &str) -> Vec<&'static str> {
+        match table {
+            User::ID => column_names::<User>(),
+            Account::ID => column_names::<Account>(),
+            Security::ID => column_names::<Security>(),
+            Asset::ID => column_names::<Asset>(),
+            Position::ID => column_names::<Position>(),
+            Order::ID => column_names::<Order>(),
+            Trade::ID => column_names::<Trade>(),
+            other => panic!("表 {other:?} 未接入读侧取行分派（columns_of 缺臂）"),
+        }
+    }
+
     /// 日终 dump 回 JSON —— 与 `load` 对偶，路径同样取自 `Spec::file`。
     ///
     /// 只回写 `Kind::State` 的四张表（资金/持仓/订单/成交）；新增可变表时在此多一行。
@@ -194,6 +252,29 @@ impl Snapshot {
         save_table(&self.trades, root)?;
         Ok(())
     }
+}
+
+/// 行 → JSON：与 journal / [`Snapshot::save`] 同一份 serde 实现，出口与快照共用。
+fn encode_row<T: serde::Serialize>(row: &T) -> serde_json::Value {
+    serde_json::to_value(row).expect("行应可序列化 —— 与 journal/save 同一份 serde 实现")
+}
+
+/// 强类型表 → `(行键, 行 JSON)`（排序由调用方统一做）。
+fn mirror_rows<T: DataTable + serde::Serialize>(table: &Table<T>) -> Vec<(String, serde_json::Value)> {
+    table
+        .rows()
+        .iter()
+        .map(|(key, row)| (key.clone(), encode_row(row)))
+        .collect()
+}
+
+/// 列枚举 → 列名清单。
+fn column_names<T: DataTable>() -> Vec<&'static str> {
+    T::Column::ALL
+        .iter()
+        .copied()
+        .map(|column| column.as_str())
+        .collect()
 }
 
 /// 资金变动的一切入口都走这里，保证 `available + frozen` 守恒。
@@ -250,6 +331,7 @@ pub fn unfreeze(asset: &mut Asset, amount: Money) -> Result<(), RejectReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tables::TABLES;
     use std::path::Path;
 
     fn snapshot() -> Snapshot {
@@ -324,5 +406,49 @@ mod tests {
         let snap = snapshot();
         assert!(snap.position("A001", "09018").is_some());
         assert!(snap.position("A001", "600000").is_none());
+    }
+
+    /// 3.6 的守护：读侧取行 / 取列分派必须覆盖**注册中心里的每一张表**。
+    /// 新表登记而忘在 `Snapshot` 的三个分派里加臂，这里立刻 panic（而不是下游静默少一张表）；
+    /// 顺带核对主键列都能从列名清单找到 —— 订阅请求的 `columns` / `filter` 就靠这份清单校验。
+    #[test]
+    fn read_side_dispatch_covers_every_registered_table() {
+        let snap = snapshot();
+        for spec in TABLES {
+            let columns = Snapshot::columns_of(spec.id);
+            assert!(!columns.is_empty(), "{} 的列名清单为空", spec.id);
+            for pk in spec.pk {
+                assert!(columns.contains(pk), "{} 的主键列 {pk} 不在列名清单里", spec.id);
+            }
+
+            let rows = snap.rows_json(spec.id);
+            assert_eq!(
+                rows.len(),
+                spec.expected_rows.unwrap_or(0),
+                "{} 全表扫描的行数应与注册中心一致",
+                spec.id
+            );
+            for pair in rows.windows(2) {
+                assert!(pair[0].0 <= pair[1].0, "{} 的 rows_json 未按行键排序", spec.id);
+            }
+            for (key, row) in &rows {
+                assert_eq!(
+                    snap.row_json(spec.id, key).as_ref(),
+                    Some(row),
+                    "{}/{} 单行取回应与全表扫描一致",
+                    spec.id,
+                    key
+                );
+                // 行 JSON 的键必须都落在列名清单里（出现未声明字段 = 类型与声明不同步）。
+                let object = row.as_object().expect("行应序列化为 JSON 对象");
+                for name in object.keys() {
+                    assert!(
+                        columns.iter().any(|column| *column == name),
+                        "{} 的行里出现未声明的列 {name}",
+                        spec.id
+                    );
+                }
+            }
+        }
     }
 }

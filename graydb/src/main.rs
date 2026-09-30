@@ -6,6 +6,7 @@ pub mod mem;
 pub mod pubsub;
 pub mod tables;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use account::amount::{Money, Price, Quantity, Rounding, notional};
@@ -14,7 +15,7 @@ use crate::domain::{Security, Side};
 use crate::engine::{Engine, PlaceRequest};
 use crate::journal::Journal;
 use crate::mem::Snapshot;
-use crate::pubsub::{CatchUp, Op};
+use crate::pubsub::{CatchUp, Frame, Op, RowChange, Subscribe};
 use crate::tables::{ColumnName, DataTable, composite_key_str};
 
 fn main() {
@@ -36,6 +37,7 @@ fn main() {
     demo_iterate(&snapshot);
     demo_engine(&data_root);
     demo_pubsub(&data_root);
+    demo_protocol(&data_root);
 }
 
 /// 加载：三种粒度按需选。
@@ -351,6 +353,294 @@ fn demo_pubsub(root: &Path) {
     assert!(matches!(tiny.catch_up(0), CatchUp::Lagged { .. }), "跌出窗口的游标必须降级");
     assert_eq!(tiny.seq(), tiny.durable(), "淘汰历史不动落盘序号，写路径无感");
     assert!(tiny.broadcast().dropped_rows() > 0, "慢消费者的代价只落在它自己的历史上");
+}
+
+/// 消费者本地镜像：`表 -> (行键 -> 行 JSON)`，只从帧里长出来，不直接读内核。
+type Mirror = BTreeMap<&'static str, BTreeMap<String, serde_json::Value>>;
+
+/// 把一个帧序列打进本地镜像：`SNAPSHOT_BEGIN` 建桶、快照行覆盖、`Delta` 逐条应用。
+/// 与测试里那份 `apply_frames` 同构，但这里只负责把协议跑给人看，不做断言密集的对账。
+fn replay(mirror: &mut Mirror, frames: &[Frame]) {
+    for frame in frames {
+        match frame {
+            Frame::SnapshotBegin { table, .. } => {
+                mirror.insert(*table, BTreeMap::new());
+            }
+            Frame::SnapshotRow(change) => apply_change(mirror, change),
+            Frame::Delta { changes, .. } => {
+                for change in changes {
+                    apply_change(mirror, change);
+                }
+            }
+            Frame::SnapshotEnd { .. } | Frame::RebuildRequired { .. } => {}
+        }
+    }
+}
+
+/// `Upsert` 覆盖本地行，`Delete` 摘行（不带行值，靠行键定位）。
+fn apply_change(mirror: &mut Mirror, change: &RowChange) {
+    let bucket = mirror
+        .get_mut(change.table)
+        .unwrap_or_else(|| panic!("帧里出现了没订的表 {}", change.table));
+    match change.op {
+        Op::Upsert => {
+            bucket.insert(
+                change.key.clone(),
+                change.row.clone().expect("Upsert 必带行"),
+            );
+        }
+        Op::Delete => {
+            bucket.remove(&change.key);
+        }
+    }
+}
+
+/// 3.2 + 3.6：订阅协议与快照下发。表清单靠注册中心校验、取行靠 `Snapshot` 分派，
+/// 所以新表接入不必改协议代码；快照与增量共用同一份过滤与裁列口径。
+fn demo_protocol(root: &Path) {
+    println!("\n[10] 订阅协议与快照下发：帧序列 → 消费者镜像");
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("graydb-demo-proto-{}.journal.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let journal = Journal::open(&path).expect("演示 journal 打开失败");
+    let mut engine = Engine::new(Snapshot::load(root).expect("重新加载一份干净镜像"), journal);
+
+    // ① 订约：四张可变表全列 + 全量快照。水位 = 当前 durable，快照行全打在这个 seq 上。
+    let (mut sub, frames) = engine
+        .subscribe(Subscribe::new(&["account_asset", "position", "orders", "trades"]))
+        .expect("四张可变表应可订全量快照");
+    let (mut barriers, mut snapshot_rows) = (0_usize, 0_usize);
+    for frame in &frames {
+        match frame {
+            Frame::SnapshotBegin { .. } | Frame::SnapshotEnd { .. } => barriers += 1,
+            Frame::SnapshotRow(_) => snapshot_rows += 1,
+            other => panic!("attach 不该发出增量帧：{other:?}"),
+        }
+    }
+    println!(
+        "  attach：水位 seq={}，{} 帧 = {barriers} 道屏障（{} 表 × 2）+ {snapshot_rows} 行快照",
+        sub.cursor(),
+        frames.len(),
+        sub.tables().len(),
+    );
+    let mut mirror: Mirror = BTreeMap::new();
+    replay(&mut mirror, &frames);
+    assert_eq!(
+        mirror,
+        kernel_mirror(&engine, sub.tables()),
+        "接入那一刻消费者镜像就该等于内核镜像"
+    );
+
+    // ② 写一组：卖光 09018。增量只发 seq 大于水位的行，快照与增量交接不重不漏。
+    engine
+        .place_and_fill(PlaceRequest {
+            order_id: "O-PROTO-S1",
+            account_id: "A001",
+            symbol: "09018",
+            side: Side::Sell,
+            price: Price::from_units(90_025),
+            quantity: Quantity::from_units(800),
+            created_at: "2026-09-29T09:30:00Z",
+        })
+        .expect("演示卖出成交不应被拒");
+    let frames = engine.poll(&mut sub);
+    for frame in &frames {
+        if let Frame::Delta { through, changes } = frame {
+            println!("  poll：Delta through={through}，{} 行：", changes.len());
+            for change in changes {
+                println!(
+                    "    seq={} {:<13} 键={:<12} op={:?} 带行={}",
+                    change.seq, change.table, change.key, change.op, change.row.is_some()
+                );
+            }
+        }
+    }
+    replay(&mut mirror, &frames);
+    assert_eq!(mirror, kernel_mirror(&engine, sub.tables()), "增量之后两边仍逐行相等");
+    assert_eq!(sub.cursor(), engine.durable(), "跟上当前位后水位应齐平");
+    assert!(
+        !mirror["position"].contains_key(&composite_key_str(&["A001", "09018"])),
+        "卖光后消费者本地不该残留那行仓位"
+    );
+
+    // ③ 先给 A001 建一笔新仓位（09018 已卖光），再看裁列 + 账户过滤：快照行与增量行走同一个
+    // 口径，否则消费者会得到「没裁过的快照 + 裁过的增量」。
+    engine
+        .place_and_fill(PlaceRequest {
+            order_id: "O-PROTO-B1",
+            account_id: "A001",
+            symbol: "600000",
+            side: Side::Buy,
+            price: Price::from_units(60_600),
+            quantity: Quantity::from_units(100),
+            created_at: "2026-09-29T09:31:00Z",
+        })
+        .expect("演示买入成交不应被拒");
+    replay(&mut mirror, &engine.poll(&mut sub));
+    assert_eq!(mirror, kernel_mirror(&engine, sub.tables()), "买入成交后两边仍逐行相等");
+
+    let (mut filtered, frames) = engine
+        .subscribe(
+            Subscribe::new(&["position"])
+                .columns(&["quantity"])
+                .accounts(&["A001"]),
+        )
+        .expect("position 的主键首列是 account_id，应放行按账户分流");
+    let picked: Vec<(String, Vec<String>)> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::SnapshotRow(change) => {
+                let mut columns: Vec<String> = change
+                    .row
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .map(|object| object.keys().cloned().collect())
+                    .unwrap_or_default();
+                columns.sort();
+                Some((change.key.clone(), columns))
+            }
+            _ => None,
+        })
+        .collect();
+    println!(
+        "  裁列 + 过滤（只订 A001 的 position，只要 quantity）：{} 行，水位 seq={}",
+        picked.len(),
+        filtered.cursor(),
+    );
+    for (key, columns) in &picked {
+        println!("    键={key} 列={}", columns.join(","));
+    }
+    assert_eq!(
+        picked.len(),
+        1,
+        "A001 此刻只应有 600000 一行仓位（09018 已被上面的卖光消掉），否则下面的断言是空话"
+    );
+    assert!(
+        picked.iter().all(|(key, _)| key.starts_with("A001")),
+        "快照不该漏进别人的行"
+    );
+    assert!(
+        picked.iter().all(|(_, columns)| columns == &["account_id", "quantity", "symbol"]),
+        "裁列后应剩请求列 ∪ 主键列（裁掉主键会让消费者拼不回行）"
+    );
+
+    // 本组没有本订阅者的行：帧仍要发、水位仍要推 —— 「≤ through 已确认无你的行」必须说出口。
+    engine
+        .place(PlaceRequest {
+            order_id: "O-PROTO-B2",
+            account_id: "A002",
+            symbol: "600000",
+            side: Side::Buy,
+            price: Price::from_units(60_600),
+            quantity: Quantity::from_units(100),
+            created_at: "2026-09-29T09:32:00Z",
+        })
+        .expect("A002 下单不应被拒");
+    let frames = engine.poll(&mut filtered);
+    println!(
+        "  只动别人的一组之后：{}，游标 → {}",
+        describe_frames(&frames),
+        filtered.cursor(),
+    );
+    let [Frame::Delta { through, changes }] = frames.as_slice() else {
+        panic!("应拿到恰好一个增量帧：{frames:?}");
+    };
+    assert!(changes.is_empty(), "别人的行不该泄给只订 A001 的订阅者");
+    assert_eq!(*through, engine.durable(), "空批也要把水位推到当前位");
+
+    // ④ 越界拒订：过滤与列名都在 attach 当场拒，不退成一个笼统的 Invalid。
+    for (spec, expect) in [
+        (
+            Subscribe::new(&["orders"]).accounts(&["A001"]),
+            "orders 的主键是 order_id，Delete 无法按账户归属",
+        ),
+        (
+            Subscribe::new(&["position"]).columns(&["qty"]),
+            "列名拼错要指认到列",
+        ),
+        (
+            Subscribe::new(&["orders"]).ops(&[Op::Delete]),
+            "要快照就必须订 Upsert",
+        ),
+    ] {
+        let tables = spec.tables.join(",");
+        match engine.subscribe(spec) {
+            Ok(_) => panic!("{tables} 这条请求本应被拒（{expect}）"),
+            Err(error) => println!("  拒订 {tables}：{error}（{expect}）"),
+        }
+    }
+
+    // ⑤ 落后到窗口外：协议层只说明一件事 —— 重新下发快照，而且不推游标。
+    let mut tiny_path = std::env::temp_dir();
+    tiny_path.push(format!("graydb-demo-proto-tiny-{}.journal.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&tiny_path);
+    let tiny_journal = Journal::open(&tiny_path).expect("小环演示 journal 打开失败");
+    let mut tiny = Engine::with_ring(Snapshot::load(root).expect("重新加载日初镜像"), tiny_journal, 1);
+    let (mut slow, _) = tiny
+        .subscribe(Subscribe::new(&["orders"]).delta_only())
+        .expect("只增量接入应放行");
+    for (order_id, symbol) in [("O-TINY-P1", "600000"), ("O-TINY-P2", "09018")] {
+        tiny
+            .place(PlaceRequest {
+                order_id,
+                account_id: "A002",
+                symbol,
+                side: Side::Buy,
+                price: Price::from_units(60_600),
+                quantity: Quantity::from_units(100),
+                created_at: "2026-09-29T09:33:00Z",
+            })
+            .expect("小环不影响受理");
+    }
+    let frames = tiny.poll(&mut slow);
+    println!(
+        "  落后订阅者：{}，游标仍停在 {}（缺口不能靠推进掩盖）",
+        describe_frames(&frames),
+        slow.cursor(),
+    );
+    assert!(
+        matches!(frames.as_slice(), [Frame::RebuildRequired { .. }]),
+        "跌出窗口的订阅者只能拿到重建信号：{frames:?}"
+    );
+    assert_eq!(slow.cursor(), 0, "重建前不得推进游标");
+    // 重建的正确姿势就是重新走一遍 attach。
+    let (rebuilt, frames) = tiny
+        .subscribe(Subscribe::new(&["orders"]))
+        .expect("重新订约应被接受");
+    let mut mirror: Mirror = BTreeMap::new();
+    replay(&mut mirror, &frames);
+    assert_eq!(mirror, kernel_mirror(&tiny, rebuilt.tables()), "重建后镜像应等于内核");
+    println!(
+        "  重新 attach：{} 帧，水位 seq={}，镜像已与内核一致",
+        frames.len(),
+        rebuilt.cursor(),
+    );
+}
+
+/// 内核当前镜像（只取本订阅者订的那几张表）：走 `Snapshot::rows_json` 的分派臂。
+fn kernel_mirror(engine: &Engine, tables: &[&'static str]) -> Mirror {
+    tables
+        .iter()
+        .map(|table| (*table, engine.snapshot.rows_json(table).into_iter().collect()))
+        .collect()
+}
+
+/// 把帧序列压成一句能打印的话。
+fn describe_frames(frames: &[Frame]) -> String {
+    frames
+        .iter()
+        .map(|frame| match frame {
+            Frame::SnapshotBegin { table, seq, .. } => format!("SNAPSHOT_BEGIN({table}@{seq})"),
+            Frame::SnapshotRow(change) => format!("SNAPSHOT_ROW({})", change.key),
+            Frame::SnapshotEnd { table, rows } => format!("SNAPSHOT_END({table}:{rows})"),
+            Frame::Delta { through, changes } => format!("DELTA(≤{through},{}行)", changes.len()),
+            Frame::RebuildRequired { lost_through } => {
+                format!("REBUILD_REQUIRED（≤{lost_through} 已被淘汰，需重新下发快照）")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 泛型遍历：编译期落到具体 `Table<T>`，运行时零擦除（没进 `dyn`，也没造行包装）。

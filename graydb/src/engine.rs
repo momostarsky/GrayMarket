@@ -22,12 +22,14 @@ use std::path::Path;
 
 use account::amount::{Amount, MicroAmount, Money, Price, Quantity, Rounding, notional};
 use rust_decimal::Decimal;
-use serde::Serialize;
 
 use crate::domain::{Asset, Order, OrderStatus, Position, Side, Trade};
 use crate::journal::{Entry, GroupWriter, Journal, Record};
 use crate::mem::Snapshot;
-use crate::pubsub::{Broadcast, CatchUp, DEFAULT_RING_ROWS, Note, Op, RowChange};
+use crate::pubsub::{
+    Broadcast, CatchUp, DEFAULT_RING_ROWS, Frame, Note, Op, RowChange, SnapshotMode, Subscribe,
+    SubscribeError, Subscriber,
+};
 use crate::tables::{composite_key_str, DataTable};
 
 /// 拒单原因。计划 1.2 的六个为主，其余是实现全链路时必然要区分的分支（宁可多列，不合并成
@@ -239,6 +241,71 @@ impl Engine {
         self.broadcast.catch_up(after_seq)
     }
 
+    /// 3.2 建订阅：先校验请求，再抓快照水位，出 `SNAPSHOT_BEGIN / ROW / END` 帧序列。
+    ///
+    /// 代价是 O(订阅表行数)，全部发生在被调用的那一刻；内核不替它排队也不等它跑完
+    /// （真并发的发送侧属 3.4）。水位取 [`Engine::durable`]：静置时 `published == durable`，
+    /// 所以「快照截至哪一组」与「日志落到哪一组」是同一个数 —— 快照与增量交接不可能重或漏。
+    pub fn subscribe(&self, spec: Subscribe) -> Result<(Subscriber, Vec<Frame>), SubscribeError> {
+        let tables = spec.validate()?;
+        let watermark = self.durable();
+        debug_assert_eq!(
+            self.broadcast.published(),
+            watermark,
+            "建订阅时出口应与落盘齐平（阶段 3.1 不变量）：已发布 {}，已落盘 {watermark}",
+            self.broadcast.published()
+        );
+        let subscriber = Subscriber::new(spec, tables, self.term, watermark);
+        let mut frames = Vec::new();
+        if matches!(subscriber.snapshot_mode(), SnapshotMode::Full) {
+            for &table in subscriber.tables() {
+                frames.push(Frame::SnapshotBegin {
+                    table,
+                    term: subscriber.term(),
+                    seq: watermark,
+                });
+                let mut rows = 0_usize;
+                // 快照行全是 `Upsert`（`validate` 已保证订了 Upsert），判定口径与增量一致：
+                // 同一份过滤 + 同一份裁列，否则消费者会得到「没裁过的快照 + 裁过的增量」。
+                for (key, row) in self.snapshot.rows_json(table) {
+                    if !subscriber.admits_key(table, &key) {
+                        continue;
+                    }
+                    frames.push(Frame::SnapshotRow(RowChange {
+                        term: subscriber.term(),
+                        seq: watermark,
+                        table,
+                        key,
+                        op: Op::Upsert,
+                        row: Some(subscriber.project(table, row)),
+                    }));
+                    rows += 1;
+                }
+                frames.push(Frame::SnapshotEnd { table, rows });
+            }
+        }
+        Ok((subscriber, frames))
+    }
+
+    /// 3.2/3.3 增量交付：按订阅者自己的游标拉一段，过滤 + 裁列后包成一帧 `Delta`。
+    ///
+    /// 落后于窗口时只发 [`Frame::RebuildRequired`] 且**不推进游标** —— 缺口不能靠推进掩盖，
+    /// 否则重建之后本地副本会永久少了那一段。已跟上则不刷空帧。
+    pub fn poll(&self, subscriber: &mut Subscriber) -> Vec<Frame> {
+        match self.broadcast.catch_up(subscriber.cursor()) {
+            CatchUp::Delta { through, changes, .. } => {
+                if through <= subscriber.cursor() {
+                    return Vec::new();
+                }
+                let changes = subscriber.take_batch(through, changes);
+                vec![Frame::Delta { through, changes }]
+            }
+            CatchUp::Lagged { lost_through, .. } => {
+                vec![Frame::RebuildRequired { lost_through }]
+            }
+        }
+    }
+
     /// 1.3：每笔写恰好一个序号；上一个分配未落盘就是空洞，宁停不脏。
     fn alloc_seq(&mut self) -> i64 {
         if self.seq != self.durable {
@@ -315,7 +382,7 @@ impl Engine {
         let mut changes = Vec::with_capacity(notes.len());
         for note in notes {
             let row = match note.op {
-                Op::Upsert => Some(row_json(&self.snapshot, note.table, &note.key).unwrap_or_else(|| {
+                Op::Upsert => Some(self.snapshot.row_json(note.table, &note.key).unwrap_or_else(|| {
                     panic!(
                         "出口登记的 {} 行 {} 在表里找不到 —— 登记与实际写入不一致（阶段 3.1）",
                         note.table, note.key
@@ -977,24 +1044,8 @@ impl Engine {
     }
 }
 
-/// 出口取行：把表身份（`Spec::id`）翻译成具体行的 JSON。新可变表进内核时必须在这里加一臂；
-/// 漏加的后果是发布时 `panic`（登记了却取不到行），而不是静默丢一个变更。
-/// `row_json_dispatches_every_mutable_table` 测试钉住四张表都能取到。
-fn row_json(snapshot: &Snapshot, table: &str, key: &str) -> Option<serde_json::Value> {
-    match table {
-        Asset::ID => snapshot.assets.get(key).map(encode_row),
-        Position::ID => snapshot.positions.get(key).map(encode_row),
-        Order::ID => snapshot.orders.get(key).map(encode_row),
-        Trade::ID => snapshot.trades.get(key).map(encode_row),
-        other => panic!("表 {other:?} 未接入订阅出口（row_json 缺分派臂）"),
-    }
-}
-
-/// 行→JSON 只走 serde 一条路：与 journal 落盘、快照文件同一份序列化实现，
-/// 订阅端拿到的行与日志里的行不可能不一致。
-fn encode_row<T: Serialize>(row: &T) -> serde_json::Value {
-    serde_json::to_value(row).expect("行应可序列化")
-}
+// 出口取行已归到 `Snapshot::row_json`（阶段 3.2）：发布一行与下发快照共用同一张分派表，
+// 不留两套「都能取到行但可能取得不一样」的实现。
 
 /// 扣减专用：`Amount::checked_sub` 只挡算术溢出，减成负数是 `Some(负值)` —— 金额层允许负
 /// （盈亏需要），而余额/持仓的语义不允许。拿它当「不够减」的判断会漏判，所有扣减统一走这里。
@@ -1761,7 +1812,7 @@ mod tests {
     const MUTABLE_TABLES: [&str; 4] = [Asset::ID, Position::ID, Order::ID, Trade::ID];
 
     /// 某张表当前的全部行 `(键, JSON)`，按键排序。取行故意在测试里另写一套，
-    /// 不与生产的 `row_json` 共用代码 —— 否则漏一张表永远测不出来。
+    /// 不与生产的 [`Snapshot::row_json`] 共用代码 —— 否则漏一张表永远测不出来。
     fn rows_of(table: &str, snapshot: &Snapshot) -> Vec<(String, serde_json::Value)> {
         let mut rows: Vec<(String, serde_json::Value)> = match table {
             Asset::ID => snapshot
@@ -2085,7 +2136,7 @@ mod tests {
         );
     }
 
-    /// 取行分派必须覆盖四张可变表：新表进内核而忘在 `row_json` 加臂，这里先红。
+    /// 取行分派必须覆盖四张可变表：新表进内核而忘在 [`Snapshot::row_json`] 加臂，这里先红。
     #[test]
     fn row_json_dispatches_every_mutable_table() {
         let mut eng = engine("pub-rowjson");
@@ -2105,18 +2156,18 @@ mod tests {
                 other => panic!("内核新增可变表 {other}，测试未跟进"),
             };
             assert!(
-                row_json(&eng.snapshot, table, &key).is_some(),
+                eng.snapshot.row_json(table, &key).is_some(),
                 "{table} 行 {key} 应能从出口取到"
             );
         }
     }
 
-    /// 未接入出口的表不得静默丢变更，而是直接 panic（宁停不脏）。
+    /// 未接入读侧分派的表不得静默返回 `None`（那等于悄悄丢变更），而是直接 panic（宁停不脏）。
     #[test]
-    #[should_panic(expected = "未接入订阅出口")]
+    #[should_panic(expected = "未接入读侧取行分派")]
     fn unregistered_table_panics_instead_of_being_dropped() {
         let eng = engine("pub-unknown");
-        let _ = row_json(&eng.snapshot, "user_info", "U001");
+        let _ = eng.snapshot.row_json("ghost_table", "G001");
     }
 
     /// 入口漏挂 `publish_group`（或落盘后改内存失败）时，变更不得混进下一组 —— 下一次写即 panic。
@@ -2130,5 +2181,297 @@ mod tests {
         // 模拟“改了内存却忘了发布”。
         eng.note_row::<Asset>("A001", Op::Upsert);
         let _ = eng.place(req("O2", "A001", "09018", Side::Buy, 90_025, 100));
+    }
+
+    // ---- 阶段 3.2/3.6：订阅协议与快照下发 ----
+
+    use std::collections::BTreeMap;
+
+    /// 消费者本地镜像：`表 -> (行键 -> 行 JSON)`，**只靠帧序列**重建，不直接读内核。
+    type Mirror = BTreeMap<&'static str, BTreeMap<String, serde_json::Value>>;
+
+    /// 把一帧打进本地镜像：屏障建桶、`Upsert` 覆盖、`Delete` 摘行、`Delta` 逐条应用。
+    ///
+    /// 这就是协议层的验收口径：镜像只能从帧里长出来，任何一处偷读内核都会让
+    /// 「不重不漏」变成靠调用顺序默好的假证。
+    fn apply_frames(mirror: &mut Mirror, frames: &[Frame]) {
+        for frame in frames {
+            match frame {
+                Frame::SnapshotBegin { table, .. } => {
+                    assert!(
+                        mirror.insert(*table, BTreeMap::new()).is_none(),
+                        "{table} 出现了两次快照屏障"
+                    );
+                }
+                Frame::SnapshotRow(change) => apply_change(mirror, change),
+                Frame::SnapshotEnd { table, rows } => {
+                    let kept = mirror.get(table).map_or(0, BTreeMap::len);
+                    assert_eq!(*rows, kept, "{table} 的 SnapshotEnd 行数应与帧重建结果一致");
+                }
+                Frame::Delta { through, changes } => {
+                    let mut prev = 0_i64;
+                    for change in changes {
+                        assert!(change.seq <= *through, "不该出现高于水位承诺的 seq");
+                        assert!(
+                            prev <= change.seq,
+                            "帧内 seq 必须升序：{prev} 之后却是 {}",
+                            change.seq
+                        );
+                        prev = change.seq;
+                        apply_change(mirror, change);
+                    }
+                }
+                Frame::RebuildRequired { lost_through } => {
+                    panic!("本用例的环应罩得住消费者，却收到了重建信号（≤{lost_through} 已淘汰）");
+                }
+            }
+        }
+    }
+
+    fn apply_change(mirror: &mut Mirror, change: &RowChange) {
+        let bucket = mirror
+            .get_mut(change.table)
+            .unwrap_or_else(|| panic!("帧里出现了没订的表 {}", change.table));
+        match change.op {
+            Op::Upsert => {
+                bucket.insert(
+                    change.key.clone(),
+                    change.row.clone().expect("Upsert 必带行"),
+                );
+            }
+            Op::Delete => {
+                assert!(change.row.is_none(), "Delete 不该带行值：{}", change.key);
+                bucket.remove(&change.key);
+            }
+        }
+    }
+
+    /// 内核当前镜像（订阅者本该重建出的东西）：取行仍走测试里那套 [`rows_of`]，不与生产共用。
+    fn kernel_mirror(engine: &Engine, tables: &[&'static str]) -> Mirror {
+        tables
+            .iter()
+            .map(|table| (*table, rows_of(table, &engine.snapshot).into_iter().collect()))
+            .collect()
+    }
+
+    /// 帧序列里的全部行变更（快照行 + 增量行），按出现顺序。
+    fn frame_changes(frames: &[Frame]) -> Vec<&RowChange> {
+        frames
+            .iter()
+            .flat_map(|frame| match frame {
+                Frame::SnapshotRow(change) => vec![change],
+                Frame::Delta { changes, .. } => changes.iter().collect(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// 3.2 核心验收：只按帧序列重建出的消费者镜像，每一步都与内核当前镜像逐行相等。
+    /// 快照与增量的交接不重不漏就在这一个 oracle 里：漏一行则镜像少一行，重一行则内容对不上。
+    #[test]
+    fn replaying_frames_rebuilds_the_kernel_mirror() {
+        let mut eng = engine("proto-mirror");
+        let tables = [Asset::ID, Position::ID, Order::ID, Trade::ID];
+        let (mut sub, frames) = eng
+            .subscribe(Subscribe::new(&tables))
+            .expect("四张可变表应当可订");
+        let watermark = eng.durable();
+        assert_eq!(
+            sub.cursor(),
+            watermark,
+            "游标应停在水位上：此前的历史已全部在快照里"
+        );
+        let begins: Vec<&'static str> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::SnapshotBegin { table, .. } => Some(*table),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(begins, tables.to_vec(), "屏障顺序应等于订阅顺序");
+        assert!(
+            frames
+                .iter()
+                .filter_map(|frame| match frame {
+                    Frame::SnapshotRow(change) => Some(change),
+                    _ => None,
+                })
+                .all(|change| change.seq == watermark && change.op == Op::Upsert),
+            "快照行的 seq 应恒为水位、op 恒为 Upsert"
+        );
+        let mut mirror: Mirror = BTreeMap::new();
+        apply_frames(&mut mirror, &frames);
+        assert_eq!(mirror, kernel_mirror(&eng, &tables), "接入那一刻镜像就该相等");
+
+        // 四步写：清仓删除 / 新建仓位与四表变更 / 下单冻结 / 撤单解冻。每步 poll 一次并对一次账。
+        let steps: [fn(&mut Engine); 4] = [
+            |e| {
+                e.place_and_fill(req("OS", "A001", "09018", Side::Sell, 90_025, 800))
+                    .expect("卖光持仓不应被拒");
+            },
+            |e| {
+                e.place_and_fill(req("OA2", "A002", "600000", Side::Buy, 60_030, 100))
+                    .expect("A002 买入成交不应被拒");
+            },
+            |e| {
+                e.place(req("OB", "A001", "600000", Side::Buy, 60_600, 100))
+                    .expect("下单冻结不应被拒");
+            },
+            |e| {
+                e.cancel("OB").expect("撤单不应失败");
+            },
+        ];
+        let mut delivered: Vec<RowChange> = Vec::new();
+        for (index, write) in steps.iter().enumerate() {
+            write(&mut eng);
+            let frames = eng.poll(&mut sub);
+            delivered.extend(frame_changes(&frames).into_iter().cloned());
+            apply_frames(&mut mirror, &frames);
+            assert_eq!(mirror, kernel_mirror(&eng, &tables), "第 {index} 步之后镜像应仍逐行相等");
+            assert_eq!(sub.cursor(), eng.durable(), "第 {index} 步之后水位应齐平");
+        }
+        // 交接处的硬约束：增量里任何一行都不得落回快照已覆盖的水位之内。
+        assert!(
+            delivered.iter().all(|change| change.seq > watermark),
+            "快照截至 {watermark}，增量应从 {watermark} 之后开始"
+        );
+        assert!(
+            delivered.iter().any(|change| change.op == Op::Delete),
+            "卖光仓位那一组应有一条不带行值的 Delete"
+        );
+    }
+
+    /// 账户过滤与裁列在快照与增量上是同一口径：否则消费者会得到「没裁过的快照 + 裁过的增量」。
+    /// 同时钉住两个细节：裁列必留主键；本订阅者无行的那一组也要推水位。
+    #[test]
+    fn account_filter_and_projection_apply_to_snapshot_and_delta_alike() {
+        let mut eng = engine("proto-filter");
+        let (mut sub, frames) = eng
+            .subscribe(
+                Subscribe::new(&[Position::ID])
+                    .columns(&["quantity"])
+                    .accounts(&["A001"]),
+            )
+            .expect("position 的主键首列是 account_id，应放行");
+        // 快照：只有 A001 的行，且只带「请求列 ∪ 主键列」。
+        let rows: Vec<&RowChange> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::SnapshotRow(change) => Some(change),
+                _ => None,
+            })
+            .collect();
+        assert!(!rows.is_empty(), "日初应有 A001 的持仓行");
+        for change in &rows {
+            assert!(change.key.starts_with("A001"), "快照漏了别人的行：{}", change.key);
+            let keys: Vec<&str> = change
+                .row
+                .as_ref()
+                .expect("快照行必带行")
+                .as_object()
+                .expect("行应是对象")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            // `serde_json::Map` 是有序的（BTreeMap），故 keys() 就是字典序，直接整体比对。
+            assert_eq!(
+                keys,
+                vec!["account_id", "quantity", "symbol"],
+                "裁列后应剩请求列 ∪ 主键列"
+            );
+        }
+
+        // A002 买回：本订阅者一行看不到，但水位必须推进 —— 「≤ through 已确认无你的行」得说出口。
+        eng.place_and_fill(req("OA2", "A002", "600000", Side::Buy, 60_030, 100))
+            .expect("A002 买入成交不应被拒");
+        let seq_a2 = eng.seq();
+        let frames = eng.poll(&mut sub);
+        let [Frame::Delta { through, changes }] = frames.as_slice() else {
+            panic!("应拿到一个空增量帧，实际：{frames:?}");
+        };
+        assert_eq!(*through, seq_a2);
+        assert!(changes.is_empty(), "A002 的行不该泄给只订 A001 的订阅者");
+        assert_eq!(sub.cursor(), seq_a2, "空批也要推水位，否则订阅者永远欠着一段");
+        // 内核确实改了（否则上面的“看不到”是因为根本没发生）。
+        assert!(
+            rows_of(Position::ID, &eng.snapshot)
+                .iter()
+                .any(|(key, row)| key == "A002:600000"
+                    && row["quantity"]["units"] == serde_json::json!(2100)),
+            "A002 仓位应已变多"
+        );
+
+        // A001 卖光：不带行值的 `Delete` 必须到达（只看行键的意义就在这）。
+        eng.place_and_fill(req("OS", "A001", "09018", Side::Sell, 90_025, 800))
+            .expect("卖光持仓不应被拒");
+        let frames = eng.poll(&mut sub);
+        let changes = frame_changes(&frames);
+        assert!(
+            changes.iter().any(|change| change.op == Op::Delete
+                && change.key == composite_key_str(&["A001", "09018"])),
+            "本账户的清仓删除必须到达：{frames:?}"
+        );
+        assert!(
+            changes.iter().all(|change| change.key.starts_with("A001")),
+            "增量也不得漏别人的行"
+        );
+        assert_eq!(sub.cursor(), eng.durable());
+    }
+
+    /// `ops` 是订阅者的选择，不是内核的注解：没订的 op 不发，但水位照推（不然下一段永远补不上）。
+    #[test]
+    fn ops_filter_drops_what_the_subscriber_did_not_ask_for() {
+        let mut eng = engine("proto-ops");
+        let (mut sub, frames) = eng
+            .subscribe(
+                Subscribe::new(&[Position::ID])
+                    .ops(&[Op::Upsert])
+                    .delta_only(),
+            )
+            .expect("只订 Upsert + 不要快照应放行");
+        assert!(frames.is_empty(), "delta_only 不该下发快照帧");
+        // 卖光仓位：同一组里既有 position 的 Delete，也有 asset/orders/trades 的 Upsert。
+        eng.place_and_fill(req("OS", "A001", "09018", Side::Sell, 90_025, 800))
+            .expect("卖光持仓不应被拒");
+        let frames = eng.poll(&mut sub);
+        let changes = frame_changes(&frames);
+        assert!(!changes.is_empty(), "订了 Upsert 就该拿到本表的新增行");
+        assert!(
+            changes.iter().all(|change| change.op == Op::Upsert),
+            "没订 Delete 就不该看到它：{frames:?}"
+        );
+        assert_eq!(sub.cursor(), eng.durable(), "被过滤掉的变更不欠账，水位仍要推进");
+    }
+
+    /// 落后到窗口外：只发 `RebuildRequired`，且游标一步不推 —— 缺口不能靠推进掩盖。
+    #[test]
+    fn a_lagging_subscriber_gets_rebuild_required_and_keeps_its_cursor() {
+        let mut eng = Engine::with_ring(
+            snapshot(),
+            Journal::open(&journal_path("proto-lag")).expect("测试 journal 打开失败"),
+            1,
+        );
+        let (mut sub, frames) = eng
+            .subscribe(Subscribe::new(&[Order::ID]).delta_only())
+            .expect("水位 0 起订");
+        assert!(frames.is_empty(), "delta_only 不该下发快照帧");
+        eng.place_and_fill(req("O1", "A001", "09018", Side::Buy, 90_025, 100))
+            .expect("下单成交不应被拒");
+        eng.place_and_fill(req("O2", "A001", "09018", Side::Buy, 90_025, 100))
+            .expect("第二组下单成交不应被拒");
+        let frames = eng.poll(&mut sub);
+        assert!(
+            matches!(frames.as_slice(), [Frame::RebuildRequired { lost_through }] if *lost_through >= 1),
+            "第一组已被整组淘汰，只能要求重建：{frames:?}"
+        );
+        assert_eq!(sub.cursor(), 0, "落后时不得推进游标，否则重建后本地永远少一段");
+        // 重建的正确姿势就是重新走一遍协议：新订阅者的快照应直接等于内核镜像。
+        let (fresh, frames) = eng
+            .subscribe(Subscribe::new(&[Order::ID]))
+            .expect("重建应当被接受");
+        let mut mirror: Mirror = BTreeMap::new();
+        apply_frames(&mut mirror, &frames);
+        assert_eq!(mirror, kernel_mirror(&eng, &[Order::ID]), "重建后的镜像必须与内核一致");
+        assert_eq!(fresh.cursor(), eng.durable());
     }
 }
