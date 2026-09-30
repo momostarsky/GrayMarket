@@ -403,6 +403,11 @@ PG 通道不许两行算出同一主键                      ← `Rows::Unkeyed`
 | 4.4 日终归档 | ⏳ | 重放日志 → `COPY` 进 PG，顺带产出 Parquet 冷备；导出 SQL 由 `TABLES` 生成 |
 | 4.5 读侧换源 | ✅ | 替换数据源：`load_table::<T>()` 不再直读文件，统一走 `load_from_source(spec, &Source)`；`Rows::{Keyed,Unkeyed}` 在类型上区分「外层键从哪来」；`declared_key` 合并加载期与内核写入期的两段拼键；试点 `tb_pdmage_pd_unit_capit_trade` 转正为第 8 张登记表（首个 `schema = Some("jzdb_prod")`）；`data/` 开始向测试 fixture 退化 |
 
+**4.1 开工前必须先裁决的两处形状落差**（下列结论由**读 DDL + 读 `amount.rs` 序列化实现**算出，**尚未实测**；首次真读时先拿它们开刀）：
+
+1. **金额列的 JSON 形状对不上**：PG 的 `COPY … WITH (FORMAT json)` 把 `numeric` 输出成**裸数字**（如 `4321.0000`），而 `Amount` 的 `Deserialize` 走的是 `deserialize_struct`，**只认 `{"units":N}`**（`amount.rs` 的 `Repr`）。两者不重合 → 首次真读必失败。候选：（a）SQL 侧把金额列包成 `json_build_object('units', (round(col * 100))::bigint)`，其余列原样 —— 序列化口径不动，代价是 `COPY` 的 SELECT 需由 `Spec` + 类型映射生成（与 4.4「导出 SQL 由 `TABLES` 生成」同一台机器）；（b）给 `Amount` 加一条兼容裸整数/十进制串的入口 —— 改序列口径且要定义小数位怎么舍，风险大。【4.5 的 fixture 用的是内核自己的序列化形状，恰好回避了这个落差 —— 这是 fixture 的已知局限，不能当成「PG 输出形状已验证」】
+2. **`numeric(*,4)` 撞 `Money`（scale 2）**：试点表 30 个 numeric 列里，**22 个是 4 位小数**（18 个 `numeric(18,4)` + 4 个 `numeric(16,4)`：`loan_return_comm_amt` / `loan_return_order_amt` / `loan_return_strike_amt` / `debt_strike_fee`），只有 8 个是 `numeric(18,2)`（`all_fee` / `stamp_tax` / `trans_fee` / `brkage_fee` / `"SEC_charges"` / `other_fee` / `trade_commis` / `other_commis`）；而 `tables.toml` 的 `numeric_default = "Money"` 把全表 30 个 numeric 都按 2 位口径装了 —— 拿 `Money(2)` 读一个 4 位小数的值 = **静默丢精度，正面撞铁律 4**。开工前先跑一句探针看真数据里有没有非 2 位小数的值：`SELECT count(*) FROM jzdb_prod.tb_pdmage_pd_unit_capit_trade WHERE col <> trunc(col, 2)`；非 0 则必须逐列裁决（`Money` / `MicroAmount`(6) / `Price`(4)），而不是在 SQL 里顺手 round。
+
 **4.5 验收结果**（2026-09-30）：
 
 - `cargo test --workspace` **127 passed**（account 32 + graydb 91 + codegen 4），其中 graydb 84 → 91：`tables.rs` 12 → 18（+6 个三通道测试）、`mem.rs` 5 → 6（+1 个端到端镜像测试）；`cargo clippy --workspace --all-targets -- -D warnings` **零警告**；`cargo codegen` 重跑除 `specs.rs` 多第 8 条（及试点 `register` 转正带来的行位移）外零漂移；
@@ -471,6 +476,8 @@ RustRover：Cargo 面板 → `graydb > tests` 可批量运行；`Cargo.toml` 变
 | `i128 → i64` 静默截断 | 账面值被悄悄改小 | 全 `Option`/`Result`，无饱和路径 |
 | 手写 mock JSON 字段/单位错误 | 流程跑一半对不平 | `mock_data_tests` + `mem::tests` + `Spec::expected_rows` 行数哨兵 |
 | `SCALE` 不存在数据里，喂错容器 | 同一份 JSON 被按不同口径解读 | 测试已文档化；加载时校验数量级 |
+| PG `COPY FORMAT json` 输出裸数字，而 `Amount` 只认 `{"units":N}` | 首次真读即失败（好在是响的：`Critical` 直接拒启动，不静默） | 4.1 候选（a）SQL 侧 `json_build_object('units', …)` 包住金额列，序列化口径不动（尚未实测） |
+| `numeric(*,4)` 的列被 `numeric_default = "Money"`（scale 2）装了（22/30 个 numeric 列） | 4 位小数按 2 位采信 = 静默丢精度，正面撞铁律 4 | 开工先跑 `col <> trunc(col, 2)` 探针；非 0 则逐列裁决 `Money`/`MicroAmount`/`Price`，不在 SQL 里顺手 round |
 | 表数量增长导致加载/校验/保存三处不同步 | 静默少加载一张表，业务在缺数据的情况下继续跑 | ✅ 已缓解：阶段 0.5 表清单单一事实源 + 守护测试 |
 | 表名在 topic / WAL / COPY 三处各写一遍字符串 | 拼写不一致，订阅收不到、归档进错表 | ✅ 已缓解：`Spec::id` 作为唯一身份贯穿三处 |
 | 所有表同等重要（一张附表坏 = 全停） | 可用性被最弱依赖绑架 | ✅ 已缓解：`LoadPolicy` 分级启动（`Critical`/`Optional`/`Lazy`） |
